@@ -1,0 +1,193 @@
+; =====================================================================
+; ASCII Mandelbrot Fractal
+; Target: Agfa Compugraphic 9000PS (68020 / Z85C30)
+;
+; Load via monitor L command, then run with: G 02050000
+; Uses Fixed-Point 4.12 Arithmetic to avoid FPU requirement
+;
+; Ported from fractal calculation-v6.x68 (I/O board 68000 version)
+; =====================================================================
+
+    ORG $02050000
+
+; Monitor API Vectors (Agfa ROM jump table)
+PUTCHAR     EQU $0406       ; Expects char in D0.B
+PRINTSTR    EQU $0412       ; Print NUL-term string at A0
+EXIT_PROG   EQU $041E       ; Clean exit back to prompt
+GETTICKS    EQU $0424       ; D0.L = tick count (~60Hz)
+
+START:
+    movem.l D0-D7/A2-A3,-(SP)  ; Save registers
+
+    jsr     GETTICKS            ; Capture start tick
+    move.l  D0,-(SP)            ; Push start tick onto stack
+
+    move.w  #-12,D7            ; Y = -12
+.loop_y:
+    move.w  #-39,D6            ; X = -39
+.loop_x:
+
+    ; CA = X * .0458  (4.12 Fixed point -> 0.0458 * 4096 = 188)
+    move.w  D6,D0
+    muls    #188,D0
+    move.l  D0,A2              ; Save CA in A2
+
+    ; CB = Y * .08333 (4.12 Fixed point -> 0.08333 * 4096 = 341)
+    move.w  D7,D0
+    muls    #341,D0
+    move.l  D0,A3              ; Save CB in A3
+
+    ; A=CA
+    move.l  A2,D4              ; D4 = A
+    ; B=CB
+    move.l  A3,D3              ; D3 = B
+
+    ; FOR I = 0 TO 15
+    moveq   #0,D5              ; D5 = I
+
+.loop_i:
+    ; Calculate A*A
+    move.w  D4,D1
+    muls    D1,D1              ; A * A
+    asr.l   #8,D1              ; 68020 can shift >8, but split for clarity
+    asr.l   #4,D1              ; Total right shift 12 (restores 4.12 format)
+
+    ; Calculate B*B
+    move.w  D3,D2
+    muls    D2,D2              ; B * B
+    asr.l   #8,D2
+    asr.l   #4,D2
+
+    ; IF (A*A + B*B) > 4 GOTO bailout
+    move.l  D1,D0
+    add.l   D2,D0              ; A*A + B*B
+    cmp.l   #16384,D0          ; 4.0 in 4.12 format ($4000)
+    bgt     .bailout
+
+    ; B = 2*A*B + CB
+    move.w  D4,D0              ; Copy A
+    muls    D3,D0              ; A * B
+    asr.l   #8,D0              ; Right shift 11 total (multiply by 2, divide by 4096)
+    asr.l   #3,D0
+    add.l   A3,D0              ; + CB
+    move.l  D0,-(SP)           ; Save new B onto stack
+
+    ; A = A*A - B*B + CA
+    move.l  D1,D4              ; A*A
+    sub.l   D2,D4              ; - B*B
+    add.l   A2,D4              ; + CA
+
+    ; Apply new B from stack
+    move.l  (SP)+,D3
+
+    ; NEXT I
+    addq.w  #1,D5              ; I++
+    cmp.w   #16,D5
+    blt     .loop_i             ; Loop while I < 16
+
+.bailout:
+    cmp.w   #16,D5             ; Did we finish all 16 iterations?
+    beq     .print_space        ; Yes -> print space (inside set)
+
+    ; IF I>9 THEN I=I+7 (to print A-F for hex-like display)
+    move.w  D5,D0
+    cmp.w   #9,D0
+    ble     .print_digit
+    addq.w  #7,D0              ; Adjust so 10->A, 11->B, ...
+.print_digit:
+    add.w   #'0',D0            ; Convert to ASCII
+    bra     .do_print
+
+.print_space:
+    move.w  #' ',D0
+.do_print:
+    jsr     PUTCHAR
+
+    ; NEXT X
+    addq.w  #1,D6
+    cmp.w   #39,D6
+    ble     .loop_x
+
+    ; PRINT (newline)
+    move.w  #$0D,D0            ; CR
+    jsr     PUTCHAR
+    move.w  #$0A,D0            ; LF
+    jsr     PUTCHAR
+
+    ; NEXT Y
+    addq.w  #1,D7
+    cmp.w   #12,D7
+    ble     .loop_y
+
+    ; Done - compute and print elapsed time
+    jsr     GETTICKS            ; D0.L = end tick
+    move.l  (SP)+,D1            ; Pop start tick
+    sub.l   D1,D0               ; D0 = elapsed ticks
+    move.l  D0,D1               ; D1 = elapsed ticks (preserve for remainder)
+    moveq   #0,D2
+    divu.l  #60,D2:D0           ; D0 = seconds, D2 = remainder (0-59)
+    move.l  D0,D3               ; D3 = seconds
+    move.l  D2,D4               ; D4 = remainder ticks (0-59)
+    ; Print "Time: "
+    lea     STR_TIME,A0
+    movea.l #PRINTSTR,A1
+    jsr     (A1)
+    ; Print seconds
+    move.l  D3,D0
+    bsr     PRINT_DECIMAL
+    ; Print "."
+    move.w  #'.',D0
+    jsr     PUTCHAR
+    ; Compute hundredths = (remainder * 100) / 60
+    move.l  D4,D0
+    mulu.l  #100,D0             ; D0 = remainder * 100
+    moveq   #0,D2
+    divu.l  #60,D2:D0           ; D0 = hundredths (0-99), D2 = remainder (discard)
+    ; Ensure 2 digits with leading zero
+    cmp.l   #10,D0
+    bge.s   .no_lead_zero
+    move.w  #'0',D0
+    jsr     PUTCHAR
+.no_lead_zero:
+    bsr     PRINT_DECIMAL
+    ; Print " seconds\r\n"
+    lea     STR_SECONDS,A0
+    movea.l #PRINTSTR,A1
+    jsr     (A1)
+
+    movem.l (SP)+,D0-D7/A2-A3
+    jmp     EXIT_PROG
+
+; --- Print D0.L as unsigned decimal ---
+PRINT_DECIMAL:
+    movem.l D0-D3/A1,-(SP)
+    suba.w  #16,SP
+    movea.l SP,A1
+    moveq   #0,D1
+    moveq   #0,D2
+.lp1:
+    divu.l  #10,D1:D0       ; D0=quotient, D1=remainder
+    addi.b  #'0',D1
+    move.b  D1,(A1)+
+    addq.l  #1,D2
+    moveq   #0,D1
+    tst.l   D0
+    bne.s   .lp1
+.lp2:
+    subq.l  #1,D2
+    bmi.s   .lp_exit
+.lp_loop:
+    move.b  -(A1),D0
+    jsr     PUTCHAR
+    dbf     D2,.lp_loop
+.lp_exit:
+    adda.w  #16,SP
+    movem.l (SP)+,D0-D3/A1
+    rts
+
+STR_TIME:
+    DC.B    "Time: ",0
+STR_SECONDS:
+    DC.B    " seconds",13,10,0
+
+    END     START

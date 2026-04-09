@@ -1,0 +1,256 @@
+; =====================================================================
+; PI CALCULATION DEMO (SPIGOT ALGORITHM) - VERSION 2.4
+; Target: Agfa Compugraphic 9000PS (68020)
+; =====================================================================
+
+    ORG $02050000
+
+    EVEN
+; Monitor API Vectors
+PUTCHAR     EQU $0406
+PRINTSTR    EQU $0412
+EXIT_PROG   EQU $041E
+GETTICKS    EQU $0424
+SCC_A_CTRL  EQU $07000002
+SCC_A_DATA  EQU $07000003
+
+; Configuration
+NUM_DIGITS  EQU 2000        ; 2,000 digits
+WORKSPACE   EQU $02060000   ; Array A[1...m]
+
+START:
+    movem.l D0-D7/A0-A6,-(SP)
+
+    jsr     GETTICKS
+    move.l  D0,-(SP)        ; Save start tick on stack
+
+    ; --- Initialize Pi Workspace ---
+    move.l  #(10*NUM_DIGITS/3),D0   
+    lea     WORKSPACE,A0
+.init:
+    move.l  #2,(A0)+
+    subq.l  #1,D0
+    bne.s   .init
+
+    ; --- Main Spigot Loop ---
+    moveq   #0,D7           ; nines_count
+    moveq   #0,D6           ; predigit
+    moveq   #1,D5           ; j (current pass)
+
+GEN_DIGIT_LOOP:
+    ; Poll SCC for keypress (RR0 bit 0 = Rx char available)
+    btst    #0,SCC_A_CTRL
+    beq.s   .no_key
+    move.b  SCC_A_DATA,D0   ; consume the byte
+    bra     ABORT
+.no_key:
+
+    ; Compute active i: 10*(NUM_DIGITS+1-j)/3 + 10 buffer
+    moveq   #0,D4
+    move.l  #(NUM_DIGITS+1),D4
+    sub.l   D5,D4            ; D4 = NUM_DIGITS+1-j
+    mulu.l  #10,D4
+    moveq   #0,D0
+    divu.l  #3,D0:D4         ; D4 = 10*(NUM_DIGITS+1-j)/3
+    addi.l  #10,D4           ; safety buffer for carry propagation
+    move.l  #(10*NUM_DIGITS/3),D0
+    cmp.l   D0,D4
+    blt.s   .use_shrunk
+    move.l  D0,D4            ; cap at max
+.use_shrunk:
+    move.l  D4,D3            ; D3 = i (active upper bound)
+
+    ; Compute initial divisor = 2*i - 1
+    move.l  D3,D1
+    lsl.l   #1,D1
+    subq.l  #1,D1
+    move.l  D1,D2            ; D2 = divisor
+    
+    ; Point A0 to A[i]
+    lea     WORKSPACE,A0
+    move.l  D3,D0
+    subq.l  #1,D0
+    lsl.l   #2,D0
+    add.l   D0,A0
+
+    moveq   #0,D4            ; carry = 0
+
+INNER_PASS:
+    ; val = 10 * array[i] + carry * i  (10x = x<<3 + x<<1)
+    move.l  (A0),D0         
+    move.l  D0,D1
+    lsl.l   #3,D1
+    lsl.l   #1,D0
+    add.l   D1,D0            ; D0 = 10 * array[i]
+    
+    move.l  D4,D1           
+    mulu.l  D3,D1           
+    add.l   D1,D0           
+    
+    ; array[i] = val % divisor; carry = val / divisor
+    moveq   #0,D1           
+    divu.l  D2,D1:D0        ; D1 = remainder, D0 = quotient
+    move.l  D1,(A0)         
+    move.l  D0,D4           
+
+    suba.l  #4,A0           
+    subq.l  #1,D3
+    subq.l  #2,D2
+    tst.l   D3
+    bne.s   INNER_PASS
+
+    ; array[1] = carry % 10; q = carry / 10
+    lea     WORKSPACE,A0
+    moveq   #0,D2
+    divu.l  #10,D2:D4       ; D2 = remainder, D4 = quotient
+    move.l  D2,(A0)         ; Store A[1]
+    move.l  D4,D0           ; D0 is now q
+
+    ; --- Output Handling ---
+    cmp.l   #1,D5
+    bne.s   .not_first
+    move.l  D0,D6           ; Save predigit = 3
+    bra.s   .next_j
+
+.not_first:
+    cmpi.l  #9,D0
+    beq.s   .is_nine
+    cmpi.l  #10,D0
+    beq.s   .is_ten
+
+    ; Regular digit (q < 9)
+    move.l  D6,D1           
+    move.l  D0,D6           ; Save new predigit safely!
+    bsr     PRINT_D1
+    
+.out_9s:
+    tst.l   D7
+    beq.s   .next_j
+    move.b  #'9',D0
+    jsr     PUTCHAR
+    subq.l  #1,D7
+    bra.s   .out_9s
+
+.is_nine:
+    addq.l  #1,D7
+    bra.s   .next_j
+
+.is_ten:
+    move.l  D6,D1
+    addq.l  #1,D1
+    bsr     PRINT_D1
+.out_0s:
+    tst.l   D7
+    beq.s   .zero_pre
+    move.b  #'0',D0
+    jsr     PUTCHAR
+    subq.l  #1,D7
+    bra.s   .out_0s
+.zero_pre:
+    moveq   #0,D6
+
+.next_j:
+    addq.l  #1,D5
+    cmp.l   #NUM_DIGITS,D5
+    ble     GEN_DIGIT_LOOP
+
+    ; Finish
+    move.l  D6,D1
+    bsr     PRINT_D1
+
+FINISH:
+    ; --- Compute elapsed time ---
+    jsr     GETTICKS
+    move.l  (SP)+,D1        ; Pop start tick
+    sub.l   D1,D0            ; D0 = elapsed ticks
+    move.l  D0,D1
+    moveq   #0,D2
+    divu.l  #60,D2:D0        ; D0 = seconds, D2 = remainder (0-59)
+    move.l  D0,D3            ; D3 = seconds
+    move.l  D2,D4            ; D4 = remainder ticks
+    ; CR LF
+    move.b  #$0D,D0
+    jsr     PUTCHAR
+    move.b  #$0A,D0
+    jsr     PUTCHAR
+    ; Print "Time: "
+    lea     STR_TIME,A0
+    movea.l #PRINTSTR,A1
+    jsr     (A1)
+    ; Print seconds
+    move.l  D3,D0
+    bsr     PRINT_DECIMAL
+    ; Print "."
+    move.b  #'.',D0
+    jsr     PUTCHAR
+    ; Compute hundredths = (remainder * 100) / 60
+    move.l  D4,D0
+    mulu.l  #100,D0
+    moveq   #0,D2
+    divu.l  #60,D2:D0
+    cmp.l   #10,D0
+    bge.s   .no_lead_zero
+    move.b  #'0',D0
+    jsr     PUTCHAR
+.no_lead_zero:
+    bsr     PRINT_DECIMAL
+    ; Print " seconds\r\n"
+    lea     STR_SECONDS,A0
+    movea.l #PRINTSTR,A1
+    jsr     (A1)
+
+    movem.l (SP)+,D0-D7/A0-A6
+    jmp     EXIT_PROG
+
+ABORT:
+    move.b  #'#',D0
+    jsr     PUTCHAR
+    move.l  (SP)+,D0         ; Discard start tick from stack
+    bra     FINISH
+
+PRINT_D1:
+    move.l  D0,-(SP)
+    move.b  D1,D0
+    add.b   #'0',D0
+    jsr     PUTCHAR
+    cmp.l   #2,D5
+    bne.s   .skip
+    move.b  #'.',D0
+    jsr     PUTCHAR
+.skip:
+    move.l  (SP)+,D0
+    rts
+
+; --- Print D0.L as unsigned decimal ---
+PRINT_DECIMAL:
+    movem.l D0-D3/A1,-(SP)
+    suba.w  #16,SP
+    movea.l SP,A1
+    moveq   #0,D1
+    moveq   #0,D2
+.pd_lp1:
+    divu.l  #10,D1:D0
+    addi.b  #'0',D1
+    move.b  D1,(A1)+
+    addq.l  #1,D2
+    moveq   #0,D1
+    tst.l   D0
+    bne.s   .pd_lp1
+.pd_lp2:
+    subq.l  #1,D2
+    bmi.s   .pd_exit
+.pd_loop:
+    move.b  -(A1),D0
+    jsr     PUTCHAR
+    dbf     D2,.pd_loop
+.pd_exit:
+    adda.w  #16,SP
+    movem.l (SP)+,D0-D3/A1
+    rts
+
+STR_TIME:
+    DC.B    "Time: ",0
+STR_SECONDS:
+    DC.B    " seconds",13,10,0
+
+    END START

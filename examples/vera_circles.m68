@@ -1,0 +1,818 @@
+;******************************************************************************
+;
+;  vera_circles.m68 -- Filled-circle benchmark for AGFA-MON + VERA
+;
+;  Target CPU : Motorola 68020
+;  Load Addr  : $02050000
+;
+;  Draws filled circles of random size (20-80px radius) at random positions
+;  with random colors on a 320x240 8bpp (256-color) bitmap. Press any key
+;  to exit back to the text prompt.
+;
+;  Algorithm: midpoint/Bresenham filled circle - no MULU, adds/shifts only.
+;  PRNG: xorshift32 seeded from VERA scanline counter.
+;
+;******************************************************************************
+
+        ORG     $02050000
+
+; --- Monitor API -------------------------------------------------------------
+
+GETCHAR_VEC      EQU     $040C
+PRINTSTR_VEC     EQU     $0412
+EXIT_VEC         EQU     $041E
+
+SCC_A_CTRL       EQU     $07000002
+SCC_A_DATA       EQU     $07000003
+
+; --- Scratch RAM for config restore ------------------------------------------
+
+CONFIG_BUF       EQU     $02000500
+
+; --- VERA text-driver thunks -------------------------------------------------
+
+VT_VEC_CLRSCR    EQU     $02004110
+VT_VEC_CURSOR_ON EQU     $02004148
+VT_VEC_CURSOR_OFF EQU    $02004150
+
+; --- VERA CCB ----------------------------------------------------------------
+
+VT_CCB           EQU     $02000300
+VT_CUR_COL       EQU     VT_CCB+0
+VT_CUR_ROW       EQU     VT_CCB+2
+VT_SCROLL_ROW    EQU     VT_CCB+4
+VT_MAGIC         EQU     VT_CCB+6
+VT_TEXT_ATTR     EQU     VT_CCB+8
+VT_VIEW_H        EQU     VT_CCB+9
+VT_MAP_H         EQU     VT_CCB+10
+VT_FLAGS         EQU     VT_CCB+11
+VT_CURSOR_STATE  EQU     VT_CCB+12
+VT_BLINK_TIMER   EQU     VT_CCB+13
+VT_CURSOR_EN     EQU     VT_CCB+14
+VT_CURSOR_DIRTY  EQU     VT_CCB+15
+
+VT_MAGIC_VAL     EQU     $A55A
+
+; --- NVRAM -------------------------------------------------------------------
+
+NV_BASE             EQU  $07100000
+NV_MAGIC            EQU  NV_BASE+$00
+NV_CHECKSUM         EQU  NV_BASE+$01
+NV_DC_VIDEO_VAL     EQU  NV_BASE+$03
+NV_TERM_HEIGHT      EQU  NV_BASE+$09
+NV_DC_HSCALE_VAL    EQU  NV_BASE+$0A
+NV_DC_VSCALE_VAL    EQU  NV_BASE+$0B
+NV_DC_VSTART_VAL    EQU  NV_BASE+$0C
+NV_DC_VSTOP_VAL     EQU  NV_BASE+$0D
+NV_DC_BORDER_VAL    EQU  NV_BASE+$0E
+NV_TEXT_ATTR_VAL    EQU  NV_BASE+$0F
+
+DEFAULT_DC_VIDEO     EQU  $9A
+DEFAULT_TERM_HEIGHT  EQU  30
+DEFAULT_DC_HSCALE    EQU  $80
+DEFAULT_DC_VSCALE    EQU  $40
+DEFAULT_DC_VSTART    EQU  $00
+DEFAULT_DC_VSTOP     EQU  $F0
+DEFAULT_DC_BORDER    EQU  $00
+DEFAULT_TEXT_ATTR    EQU  $01
+
+; --- VERA hardware -----------------------------------------------------------
+
+VERA_BASE           EQU     $04000020
+VERA_ADDR0_L        EQU     $00
+VERA_ADDR0_M        EQU     $01
+VERA_ADDR0_H        EQU     $02
+VERA_DATA0          EQU     $03
+VERA_CTRL           EQU     $05
+VERA_IEN            EQU     $06
+VERA_ISR            EQU     $07
+VERA_DC_VIDEO       EQU     $09
+VERA_DC_HSCALE      EQU     $0A
+VERA_DC_VSCALE      EQU     $0B
+VERA_DC_BORDER      EQU     $0C
+VERA_L0_CONFIG      EQU     $0D
+VERA_L0_MAPBASE     EQU     $0E
+VERA_L0_TILEBASE    EQU     $0F
+VERA_L0_HSCROLL_L   EQU     $10
+VERA_L0_HSCROLL_H   EQU     $11
+VERA_L0_VSCROLL_L   EQU     $12
+VERA_L0_VSCROLL_H   EQU     $13
+
+; --- Bitmap geometry (8bpp) --------------------------------------------------
+
+BMP_WIDTH         EQU     320
+BMP_HEIGHT        EQU     240
+BMP_STRIDE        EQU     320
+BMP_SIZE_BYTES    EQU     76800
+
+; --- Circle limits -----------------------------------------------------------
+
+MIN_RADIUS        EQU     20
+MAX_RADIUS        EQU     80
+
+; --- PRNG state in RAM -------------------------------------------------------
+
+RNG_STATE         EQU     $02000A00
+CIRCLE_COUNT      EQU     $02000A04
+
+
+START:
+        MOVEM.L D0-D7/A0-A6,-(SP)
+
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BEQ.S   .vera_ok
+
+        LEA     STR_NO_VERA,A0
+        JSR     PRINTSTR_VEC
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        JMP     EXIT_VEC
+
+.vera_ok:
+        BSR     LOAD_VERA_CONFIG
+        JSR     VT_VEC_CURSOR_OFF
+
+        BSR     SAVE_PALETTE
+        BSR     FADE_TO_BLACK
+        BSR     ENTER_BITMAP_MODE
+        BSR     CLEAR_BITMAP
+        BSR     FADE_UP
+
+        BSR     SEED_RNG
+        MOVE.L  #0,CIRCLE_COUNT
+
+        LEA     STR_RUNNING,A0
+        JSR     PRINTSTR_VEC
+
+.main_loop:
+        BTST    #0,SCC_A_CTRL
+        BNE.W   .key_exit
+
+        BSR     DRAW_RANDOM_CIRCLE
+        ADDQ.L  #1,CIRCLE_COUNT
+        BRA.W   .main_loop
+
+.key_exit:
+        MOVE.B  SCC_A_DATA,D0
+
+        BSR     FADE_TO_BLACK
+        BSR     RESTORE_TEXT_MODE
+        JSR     VT_VEC_CURSOR_ON
+
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        JMP     EXIT_VEC
+
+
+;******************************************************************************
+;  Mode setup / restore
+;******************************************************************************
+
+ENTER_BITMAP_MODE:
+        MOVE.B  #$00,VERA_BASE+VERA_CTRL
+        MOVE.B  #$00,VERA_BASE+VERA_DC_BORDER
+        MOVE.B  #$40,VERA_BASE+VERA_DC_HSCALE
+        MOVE.B  #$40,VERA_BASE+VERA_DC_VSCALE
+        MOVE.B  CONFIG_BUF+3,D0
+        ORI.B   #$10,D0
+        MOVE.B  D0,VERA_BASE+VERA_DC_VIDEO
+
+        MOVE.B  #$07,VERA_BASE+VERA_L0_CONFIG
+        MOVE.B  #$00,VERA_BASE+VERA_L0_MAPBASE
+        MOVE.B  #$00,VERA_BASE+VERA_L0_TILEBASE
+        CLR.B   VERA_BASE+VERA_L0_HSCROLL_L
+        CLR.B   VERA_BASE+VERA_L0_HSCROLL_H
+        CLR.B   VERA_BASE+VERA_L0_VSCROLL_L
+        CLR.B   VERA_BASE+VERA_L0_VSCROLL_H
+        RTS
+
+
+RESTORE_TEXT_MODE:
+        MOVEM.L D0-D2/A0-A1,-(SP)
+
+        MOVE.W  #0,VI_V_CUR_COL
+        MOVE.W  #0,VI_V_CUR_ROW
+        MOVE.W  #0,VI_V_SCROLL_ROW
+        MOVE.B  CONFIG_BUF+VI_NV_TEXT_ATTR,VI_V_TEXT_ATTR
+        MOVE.B  CONFIG_BUF+VI_NV_TERM_HEIGHT,VI_V_VIEW_H
+        MOVE.B  #64,VI_V_MAP_H
+        MOVE.B  #$C0,VI_V_FLAGS
+        MOVE.W  #VI_MAGIC_VAL,VI_V_MAGIC
+        CLR.B   VT_CURSOR_STATE
+        CLR.B   VT_CURSOR_DIRTY
+        CLR.B   VT_CURSOR_EN
+        MOVE.B  #30,VT_BLINK_TIMER
+
+        MOVE.B  #$00,VI_VERA_BASE+VI_CTRL
+        MOVE.B  CONFIG_BUF+VI_NV_DC_HSCALE,VI_VERA_BASE+VI_DC_HSCALE
+        MOVE.B  CONFIG_BUF+VI_NV_DC_VSCALE,VI_VERA_BASE+VI_DC_VSCALE
+        MOVE.B  CONFIG_BUF+VI_NV_DC_BORDER,VI_VERA_BASE+VI_DC_BORDER
+
+        MOVE.B  #$02,VI_VERA_BASE+VI_CTRL
+        MOVE.B  #0,VI_VERA_BASE+VI_DC_VIDEO
+        MOVE.B  #160,VI_VERA_BASE+VI_DC_HSCALE
+        MOVE.B  CONFIG_BUF+VI_NV_DC_VSTART,VI_VERA_BASE+VI_DC_VSCALE
+        MOVE.B  CONFIG_BUF+VI_NV_DC_VSTOP,VI_VERA_BASE+VI_DC_BORDER
+
+        MOVE.B  #$00,VI_VERA_BASE+VI_CTRL
+        MOVE.B  CONFIG_BUF+VI_NV_DC_VIDEO,D0
+        ORI.B   #$10,D0
+        MOVE.B  D0,VI_VERA_BASE+VI_DC_VIDEO
+
+        MOVE.B  #$00,VI_VERA_BASE+VI_ADDR0_L
+        MOVE.B  #$FA,VI_VERA_BASE+VI_ADDR0_M
+        MOVE.B  #$11,VI_VERA_BASE+VI_ADDR0_H
+        LEA     VI_PAL_DATA,A1
+        MOVE.W  #511,D1
+.vpal:  MOVE.B  (A1)+,VI_VERA_BASE+VI_DATA0
+        DBRA    D1,.vpal
+
+        MOVE.B  #$00,VI_VERA_BASE+VI_ADDR0_L
+        MOVE.B  #$F0,VI_VERA_BASE+VI_ADDR0_M
+        MOVE.B  #$10,VI_VERA_BASE+VI_ADDR0_H
+        LEA     VI_FONT_DATA,A1
+        MOVE.W  #2047,D1
+.vfont: MOVE.B  (A1)+,VI_VERA_BASE+VI_DATA0
+        DBRA    D1,.vfont
+
+        MOVE.B  #$60,VI_VERA_BASE+VI_L0_CONFIG
+        MOVE.B  #$00,VI_VERA_BASE+VI_L0_MAPBASE
+        MOVE.B  #$78,VI_VERA_BASE+VI_L0_TILEBASE
+        MOVE.B  #$00,VI_VERA_BASE+VI_L0_VSCROLL_L
+        MOVE.B  #$00,VI_VERA_BASE+VI_L0_VSCROLL_H
+
+        MOVE.B  #$00,VI_VERA_BASE+VI_ADDR0_L
+        MOVE.B  #$00,VI_VERA_BASE+VI_ADDR0_M
+        MOVE.B  #$10,VI_VERA_BASE+VI_ADDR0_H
+        MOVE.W  #8191,D1
+        MOVE.B  VI_V_TEXT_ATTR,D2
+.vclr:  MOVE.B  #$20,VI_VERA_BASE+VI_DATA0
+        MOVE.B  D2,VI_VERA_BASE+VI_DATA0
+        DBRA    D1,.vclr
+
+        MOVE.B  #$07,VI_VERA_BASE+VERA_ISR
+        MOVE.B  #$01,VI_VERA_BASE+VERA_IEN
+
+        MOVEM.L (SP)+,D0-D2/A0-A1
+        RTS
+
+
+LOAD_VERA_CONFIG:
+        MOVE.B  NV_MAGIC,D0
+        CMPI.B  #$A5,D0
+        BNE.S   .defaults
+
+        MOVEA.L #NV_BASE,A0
+        MOVEA.L #CONFIG_BUF,A1
+        MOVEQ   #40-1,D7
+.copy:  MOVE.B  (A0)+,(A1)+
+        DBRA    D7,.copy
+
+        BSR     CALC_CFG_CHECKSUM
+        CMP.B   CONFIG_BUF+1,D0
+        BEQ.S   .done
+
+.defaults:
+        BSR     INIT_DEFAULT_CONFIG
+.done:
+        RTS
+
+
+INIT_DEFAULT_CONFIG:
+        MOVEA.L #CONFIG_BUF,A0
+        MOVE.B  #$A5,(A0)+
+        MOVE.B  #$00,(A0)+
+        MOVE.B  #0,(A0)+
+        MOVE.B  #DEFAULT_DC_VIDEO,(A0)+
+        MOVE.B  #$40,(A0)+
+        MOVE.B  #$FF,(A0)+
+        MOVE.B  #0,(A0)+
+        MOVE.B  #0,(A0)+
+        MOVE.B  #80,(A0)+
+        MOVE.B  #DEFAULT_TERM_HEIGHT,(A0)+
+        MOVE.B  #DEFAULT_DC_HSCALE,(A0)+
+        MOVE.B  #DEFAULT_DC_VSCALE,(A0)+
+        MOVE.B  #DEFAULT_DC_VSTART,(A0)+
+        MOVE.B  #DEFAULT_DC_VSTOP,(A0)+
+        MOVE.B  #DEFAULT_DC_BORDER,(A0)+
+        MOVE.B  #DEFAULT_TEXT_ATTR,(A0)+
+        MOVE.B  #0,(A0)+
+        MOVEQ   #23-1,D7
+.zero:  CLR.B   (A0)+
+        DBRA    D7,.zero
+        BSR     CALC_CFG_CHECKSUM
+        MOVE.B  D0,CONFIG_BUF+1
+        RTS
+
+
+CALC_CFG_CHECKSUM:
+        MOVEQ   #0,D0
+        MOVEA.L #CONFIG_BUF+2,A0
+        MOVEQ   #38-1,D7
+.sum:   ADD.B   (A0)+,D0
+        DBRA    D7,.sum
+        RTS
+
+
+;******************************************************************************
+;  Palette save / fade
+;******************************************************************************
+
+PAL_BUF          EQU     $02000600
+PAL_ORIG         EQU     $02000800
+
+
+SAVE_PALETTE:
+        MOVEM.L D0-D1/A0-A1,-(SP)
+        LEA     VI_PAL_DATA,A0
+        LEA     PAL_BUF,A1
+        MOVE.W  #511,D1
+.cp1:   MOVE.B  (A0)+,(A1)+
+        DBF     D1,.cp1
+        LEA     VI_PAL_DATA,A0
+        LEA     PAL_ORIG,A1
+        MOVE.W  #511,D1
+.cp2:   MOVE.B  (A0)+,(A1)+
+        DBF     D1,.cp2
+        MOVEM.L (SP)+,D0-D1/A0-A1
+        RTS
+
+
+FADE_TO_BLACK:
+        MOVEM.L D0-D6/A0,-(SP)
+        MOVE.W  #15,D6
+.fade_frame:
+.wait_vs:
+        BTST    #0,VERA_BASE+VERA_ISR
+        BEQ.S   .wait_vs
+        MOVE.B  #$01,VERA_BASE+VERA_ISR
+        LEA     PAL_BUF+2,A0
+        MOVE.W  #254,D5
+.dec_entry:
+        MOVE.B  (A0),D0
+        MOVE.B  1(A0),D1
+        MOVEQ   #0,D2
+        MOVE.B  D0,D2
+        ANDI.B  #$0F,D2
+        MOVEQ   #0,D3
+        MOVE.B  D0,D3
+        LSR.B   #4,D3
+        MOVEQ   #0,D4
+        MOVE.B  D1,D4
+        ANDI.B  #$0F,D4
+        TST.B   D2
+        BEQ.S   .no_dec_b
+        SUBQ.B  #1,D2
+.no_dec_b:
+        TST.B   D3
+        BEQ.S   .no_dec_g
+        SUBQ.B  #1,D3
+.no_dec_g:
+        TST.B   D4
+        BEQ.S   .no_dec_r
+        SUBQ.B  #1,D4
+.no_dec_r:
+        MOVE.B  D3,D0
+        LSL.B   #4,D0
+        OR.B    D2,D0
+        MOVE.B  D0,(A0)+
+        MOVE.B  D4,(A0)+
+        DBF     D5,.dec_entry
+        MOVE.B  #$00,VERA_BASE+VERA_CTRL
+        MOVE.B  #$00,VERA_BASE+VERA_ADDR0_L
+        MOVE.B  #$FA,VERA_BASE+VERA_ADDR0_M
+        MOVE.B  #$11,VERA_BASE+VERA_ADDR0_H
+        LEA     PAL_BUF,A0
+        MOVE.W  #511,D5
+.wr:    MOVE.B  (A0)+,VERA_BASE+VERA_DATA0
+        DBF     D5,.wr
+        DBF     D6,.fade_frame
+        MOVEM.L (SP)+,D0-D6/A0
+        RTS
+
+
+FADE_UP:
+        MOVEM.L D0-D6/A0-A2,-(SP)
+        MOVE.W  #15,D6
+.fade_up_frame:
+.wait_vs:
+        BTST    #0,VERA_BASE+VERA_ISR
+        BEQ.S   .wait_vs
+        MOVE.B  #$01,VERA_BASE+VERA_ISR
+
+        LEA     PAL_BUF+2,A0
+        LEA     PAL_ORIG+2,A1
+        MOVE.W  #254,D5
+.inc_entry:
+        MOVE.B  (A0),D0
+        MOVE.B  (A1),D1
+
+        MOVEQ   #0,D2
+        MOVE.B  D0,D2
+        ANDI.B  #$0F,D2
+        MOVEQ   #0,D3
+        MOVE.B  D1,D3
+        ANDI.B  #$0F,D3
+        CMP.B   D3,D2
+        BHS.S   .b_ok
+        ADDQ.B  #1,D2
+.b_ok:
+        MOVEQ   #0,D3
+        MOVE.B  D0,D3
+        LSR.B   #4,D3
+        MOVEQ   #0,D4
+        MOVE.B  D1,D4
+        LSR.B   #4,D4
+        CMP.B   D4,D3
+        BHS.S   .g_ok
+        ADDQ.B  #1,D3
+.g_ok:
+        MOVE.B  D3,D0
+        LSL.B   #4,D0
+        OR.B    D2,D0
+        MOVE.B  D0,(A0)+
+
+        MOVE.B  (A0),D0
+        MOVE.B  1(A1),D1
+        MOVEQ   #0,D2
+        MOVE.B  D0,D2
+        ANDI.B  #$0F,D2
+        MOVEQ   #0,D3
+        MOVE.B  D1,D3
+        ANDI.B  #$0F,D3
+        CMP.B   D3,D2
+        BHS.S   .r_ok
+        ADDQ.B  #1,D2
+.r_ok:
+        MOVE.B  D2,(A0)+
+        ADDQ.L  #2,A1
+        DBF     D5,.inc_entry
+
+        MOVE.B  #$00,VERA_BASE+VERA_CTRL
+        MOVE.B  #$00,VERA_BASE+VERA_ADDR0_L
+        MOVE.B  #$FA,VERA_BASE+VERA_ADDR0_M
+        MOVE.B  #$11,VERA_BASE+VERA_ADDR0_H
+        LEA     PAL_BUF,A0
+        MOVE.W  #511,D5
+.wr:    MOVE.B  (A0)+,VERA_BASE+VERA_DATA0
+        DBF     D5,.wr
+
+        DBF     D6,.fade_up_frame
+        MOVEM.L (SP)+,D0-D6/A0-A2
+        RTS
+
+
+;******************************************************************************
+;  PRNG - xorshift32
+;******************************************************************************
+
+SEED_RNG:
+        MOVE.B  VERA_BASE+VERA_ISR,D0
+        ANDI.L  #$FF,D0
+        ADDQ.L  #1,D0
+        MOVE.L  D0,RNG_STATE
+        CMPI.L  #0,D0
+        BNE.S   .seeded
+        MOVE.L  #$DEADBEEF,RNG_STATE
+.seeded:
+        RTS
+
+
+RNG_NEXT:
+        ; Returns D0.L = next random 32-bit value (xorshift32)
+        MOVE.L  RNG_STATE,D0
+        MOVE.L  D0,D1
+        LSL.L   #8,D1
+        LSL.L   #5,D1
+        EOR.L   D1,D0
+        MOVE.L  D0,D1
+        LSR.L   #8,D1
+        LSR.L   #8,D1
+        LSR.L   #1,D1
+        EOR.L   D1,D0
+        MOVE.L  D0,D1
+        LSL.L   #5,D1
+        EOR.L   D1,D0
+        MOVE.L  D0,RNG_STATE
+        RTS
+
+
+;******************************************************************************
+;  Random circle parameters
+;******************************************************************************
+
+DRAW_RANDOM_CIRCLE:
+        MOVEM.L D0-D7/A0-A1,-(SP)
+
+        BSR     RNG_NEXT
+        ANDI.L  #$FF,D0
+        ADDQ.L  #1,D0
+        MOVE.L  D0,D7
+
+        BSR     RNG_NEXT
+        MOVE.L  D0,D1
+        ANDI.L  #$FF,D1
+        ADDQ.L  #1,D1
+        BNE.S   .got_radius
+        MOVEQ   #1,D1
+.got_radius:
+        ADD.W   #MIN_RADIUS-1,D1
+        CMP.W   #MAX_RADIUS,D1
+        BLE.S   .rad_ok
+        MOVE.W  #MAX_RADIUS,D1
+.rad_ok:
+        MOVE.W  D1,D4
+
+        MOVE.W  #BMP_WIDTH,D5
+        SUB.W   D4,D5
+        SUB.W   D4,D5
+        BLE.S   .cx_zero
+        BSR     RNG_NEXT
+        ANDI.L  #$FFFF,D0
+        DIVU    D5,D0
+        SWAP    D0
+        ADD.W   D4,D0
+        MOVE.W  D0,D5
+        BRA.S   .cx_done
+.cx_zero:
+        MOVE.W  #BMP_WIDTH/2,D5
+.cx_done:
+
+        MOVE.W  #BMP_HEIGHT,D6
+        SUB.W   D4,D6
+        SUB.W   D4,D6
+        BLE.S   .cy_zero
+        BSR     RNG_NEXT
+        ANDI.L  #$FFFF,D0
+        DIVU    D6,D0
+        SWAP    D0
+        ADD.W   D4,D0
+        MOVE.W  D0,D6
+        BRA.S   .cy_done
+.cy_zero:
+        MOVE.W  #BMP_HEIGHT/2,D6
+.cy_done:
+
+        MOVE.W  D5,D0
+        MOVE.W  D6,D1
+        MOVE.W  D4,D2
+        MOVE.B  D7,D3
+        BSR     DRAW_FILLED_CIRCLE
+
+        MOVEM.L (SP)+,D0-D7/A0-A1
+        RTS
+
+
+;******************************************************************************
+;  Filled circle - midpoint/Bresenham algorithm
+;
+;  In: D0.w = cx, D1.w = cy, D2.w = radius, D3.b = color
+;
+;  For each octant step (dx from 0..radius), we compute dy = the
+;  maximum displacement at that dx using the midpoint decision variable.
+;  Then we fill horizontal spans at cy+dy, cy-dy, and also fill the
+;  two center-row spans at cy (for dx==0 vs dx>0).
+;
+;  No MULU - only additions and shifts.
+;
+;******************************************************************************
+
+DRAW_FILLED_CIRCLE:
+        ; In: D0.w = cx, D1.w = cy, D2.w = radius, D3.b = color
+        ;
+        ; Register assignment:
+        ;   A0.w = cx          (preserved across FILL_SPAN_8 calls)
+        ;   D5.w = cy          (preserved)
+        ;   D6.w = dy          (vertical displacement, starts at radius)
+        ;   D4.w = dx          (horizontal displacement, starts at 0)
+        ;   D7.b = color       (preserved)
+        ;   D3.l = decision variable (only between span calls)
+        ;
+        ; Algorithm: standard midpoint circle.
+        ;   dx = 0, dy = radius, d = 1 - radius
+        ;   loop while dx <= dy:
+        ;     draw 4 horizontal spans exploiting 8-fold symmetry:
+        ;       span at y = cy-dy, x = cx-dx .. cx+dx
+        ;       span at y = cy+dy, x = cx-dx .. cx+dx
+        ;       span at y = cy-dx, x = cx-dy .. cx+dy
+        ;       span at y = cy+dx, x = cx-dy .. cx+dy
+        ;     dx++
+        ;     if d < 0:  d += 2*dx + 1
+        ;     else:      dy--; d += 2*(dx - dy) + 1
+        ;
+        MOVEM.L D0-D7/A0,-(SP)
+
+        MOVE.W  D0,A0                 ; A0 = cx
+        MOVE.W  D1,D5                 ; D5 = cy
+        MOVE.W  D2,D6                 ; D6 = dy = radius
+        MOVE.B  D3,D7                 ; D7 = color
+
+        MOVEQ   #0,D4                 ; D4 = dx = 0
+
+        MOVEQ   #0,D3
+        MOVE.W  D6,D3                 ; D3 = radius
+        NEG.W   D3
+        ADDQ.W  #1,D3                 ; D3 = 1 - radius (decision var)
+        MOVE.L  D3,MP_DECISION        ; save to RAM
+
+.mp_loop:
+        CMP.W   D4,D6
+        BLT.W   .mp_done
+
+        ; Span 1: y = cy - dy, x1 = cx - dx, x2 = cx + dx
+        MOVE.W  A0,D0
+        SUB.W   D4,D0                 ; x1 = cx - dx
+        MOVE.W  A0,D1
+        ADD.W   D4,D1                 ; x2 = cx + dx
+        MOVE.W  D5,D2
+        SUB.W   D6,D2                 ; y  = cy - dy
+        MOVE.B  D7,D3
+        BSR     FILL_SPAN_8
+
+        ; Span 2: y = cy + dy, x1 = cx - dx, x2 = cx + dx
+        MOVE.W  A0,D0
+        SUB.W   D4,D0
+        MOVE.W  A0,D1
+        ADD.W   D4,D1
+        MOVE.W  D5,D2
+        ADD.W   D6,D2                 ; y  = cy + dy
+        MOVE.B  D7,D3
+        BSR     FILL_SPAN_8
+
+        ; Span 3: y = cy - dx, x1 = cx - dy, x2 = cx + dy
+        MOVE.W  A0,D0
+        SUB.W   D6,D0                 ; x1 = cx - dy
+        MOVE.W  A0,D1
+        ADD.W   D6,D1                 ; x2 = cx + dy
+        MOVE.W  D5,D2
+        SUB.W   D4,D2                 ; y  = cy - dx
+        MOVE.B  D7,D3
+        BSR     FILL_SPAN_8
+
+        ; Span 4: y = cy + dx, x1 = cx - dy, x2 = cx + dy
+        MOVE.W  A0,D0
+        SUB.W   D6,D0
+        MOVE.W  A0,D1
+        ADD.W   D6,D1
+        MOVE.W  D5,D2
+        ADD.W   D4,D2                 ; y  = cy + dx
+        MOVE.B  D7,D3
+        BSR     FILL_SPAN_8
+
+        ; Update dx
+        ADDQ.W  #1,D4                 ; dx++
+
+        ; Recompute decision variable from scratch to avoid
+        ; accumulation errors:
+        ;   d_new = dx*dx + dy*dy - radius*radius  (if < 0, inside circle)
+        ; But that uses MULU. Instead, update incrementally:
+        ;   if old d < 0: d += 2*dx_old + 1 = 2*(dx-1) + 1
+        ;   else:         dy--; d += 2*(dx_old - dy) + 1
+        ; We already incremented dx, so dx_old = dx - 1.
+        ;
+        ; Reconstruct d in D3 from the relationship:
+        ; After the 4 span calls, D3 was trashed by FILL_SPAN_8 (it used D3
+        ; internally). We need a separate storage location for d.
+
+        ; Actually the MOVEM.L/restore at the top of each FILL_SPAN_8
+        ; saves and restores D3, so D3 is NOT preserved! We need to save d
+        ; somewhere else. Use A1 as d storage.
+        ;
+        ; ... wait, FILL_SPAN_8 does MOVEM.L D0-D7,-(SP) and restores.
+        ; That means D3 gets restored to whatever it was BEFORE the BSR.
+        ; But we set D3 = color before each BSR, so after return D3 = color.
+        ; The decision variable is lost.
+
+        ; Solution: store d in a memory location.
+        MOVE.L  MP_DECISION,D3
+
+        CMPI.W  #0,D3
+        BGE.S   .mp_dy_dec
+
+        ; d < 0: d += 2*dx_old + 1
+        MOVE.W  D4,D2                 ; dx (already incremented)
+        SUBQ.W  #1,D2                 ; dx_old = dx - 1
+        ASL.W   #1,D2                 ; 2 * dx_old
+        ADDQ.W  #1,D2                 ; + 1
+        ADD.W   D2,D3
+        BRA.S   .mp_update_done
+
+.mp_dy_dec:
+        ; d >= 0: dy--, d += 2*(dx_old - dy) + 1
+        SUBQ.W  #1,D6                 ; dy--
+        MOVE.W  D4,D2
+        SUBQ.W  #1,D2                 ; dx_old
+        SUB.W   D6,D2                 ; dx_old - dy
+        ASL.W   #1,D2                 ; 2*(dx_old - dy)
+        ADDQ.W  #1,D2                 ; + 1
+        ADD.W   D2,D3
+
+.mp_update_done:
+        MOVE.L  D3,MP_DECISION
+        BRA.W   .mp_loop
+
+.mp_done:
+        MOVEM.L (SP)+,D0-D7/A0
+        RTS
+
+
+;******************************************************************************
+;  FILL_SPAN_8 - 8bpp horizontal span fill
+;
+;  In: D0.w = x1, D1.w = x2, D2.w = y, D3.b = color
+;  Fills inclusive span on one scanline. 1 byte per pixel.
+;******************************************************************************
+
+FILL_SPAN_8:
+        MOVEM.L D0-D7,-(SP)
+
+        CMP.W   D1,D0
+        BLE.S   .ordered
+        EXG     D0,D1
+.ordered:
+        MOVE.W  D0,D4
+        MOVE.W  D1,D5
+        MOVE.W  D2,D6
+        MOVE.B  D3,D7
+
+        MOVE.W  D5,D0
+        SUB.W   D4,D0
+        ADDQ.W  #1,D0
+        SUBQ.W  #1,D0
+        BMI.S   .done
+        MOVE.W  D0,D3
+
+        MOVEQ   #0,D1
+        MOVE.W  D6,D1
+        MULU    #BMP_STRIDE,D1
+        MOVEQ   #0,D2
+        MOVE.W  D4,D2
+        ADD.L   D2,D1
+
+        MOVE.L  D1,D0
+        MOVEQ   #$10,D1
+        BSR     VERA_SET_ADDR0
+
+        MOVE.W  D3,D0
+.fill_loop:
+        MOVE.B  D7,VERA_BASE+VERA_DATA0
+        DBF     D0,.fill_loop
+
+.done:
+        MOVEM.L (SP)+,D0-D7
+        RTS
+
+
+;******************************************************************************
+;  Bitmap clear
+;******************************************************************************
+
+CLEAR_BITMAP:
+        MOVEM.L D0-D1,-(SP)
+        MOVEQ   #0,D0
+        MOVEQ   #$10,D1
+        BSR     VERA_SET_ADDR0
+
+        MOVE.L  #BMP_SIZE_BYTES-1,D0
+.clr_loop:
+        MOVE.B  #0,VERA_BASE+VERA_DATA0
+        SUBQ.L  #1,D0
+        BPL.W   .clr_loop
+
+        MOVEM.L (SP)+,D0-D1
+        RTS
+
+
+;******************************************************************************
+;  VERA address register helper
+;******************************************************************************
+
+VERA_SET_ADDR0:
+        MOVE.B  #$00,VERA_BASE+VERA_CTRL
+        MOVE.B  D0,VERA_BASE+VERA_ADDR0_L
+        LSR.L   #8,D0
+        MOVE.B  D0,VERA_BASE+VERA_ADDR0_M
+        LSR.L   #8,D0
+        ANDI.B  #$01,D0
+        OR.B    D1,D0
+        MOVE.B  D0,VERA_BASE+VERA_ADDR0_H
+        RTS
+
+
+;******************************************************************************
+;  Strings
+;******************************************************************************
+
+STR_NO_VERA:
+        DC.B    $0D,$0A
+        DC.B    "VERA console not initialized. Run from AGFA-MON with VERA active.",$0D,$0A,0
+        ALIGN   2
+
+STR_RUNNING:
+        DC.B    $0D,$0A
+        DC.B    "Circle benchmark running. Press any key to exit.",$0D,$0A,0
+        ALIGN   2
+
+MP_DECISION:
+        DC.L    0
+
+        INCLUDE "agfa-monitor/include/vera_init.inc"

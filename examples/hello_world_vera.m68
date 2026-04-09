@@ -1,0 +1,652 @@
+;******************************************************************************
+;
+;  hello_world_vera.m68 - VERA extended API test program
+;
+;  Tests the VERA extended API (VT_VEC_* calls at $02004100+).
+;  These calls go directly to RAM-resident VERA routines - they are faster
+;  than the standard API but MUST NOT be called unless VERA is initialized
+;  (VT_MAGIC == $A55A) AND the console is in VERA mode (NV_CONSOLE_OUT bit 0).
+;
+;  This program bails with an error message if VERA is not active.
+;
+;  Tests covered in this file (add one at a time as each is verified):
+;    [x] VT_VEC_PUTCHAR   - verified on hardware 06-APR-2026
+;    [x] VT_VEC_PRINTSTR  - verified on hardware 06-APR-2026
+;    [x] VT_VEC_CLR_ROW          - verified on hardware 06-APR-2026
+;    [x] VT_VEC_HANDLE_LF        - verified on hardware 06-APR-2026
+;    [x] VT_VEC_STREAM_START + VT_VEC_STREAM_CHAR - verified on hardware 06-APR-2026
+;    [x] VT_VEC_CLR_EOL         - verified on hardware 06-APR-2026
+;    [x] VT_VEC_CLR_EOS         - verified on hardware 06-APR-2026
+;    [ ] VT_VEC_CLRSCR    - ALWAYS KEEP THIS TEST LAST (clears screen)
+;
+;  Assemble: vasmm68k_mot.exe -m68020 -Fsrec -o hello_world_vera.s19 hello_world_vera.m68
+;  Load:     L at AGFA-MON prompt, paste .s19, then G 02050000
+;
+;  Expected output (VERA mode):
+;    VERA: detected | console: VERA
+;
+;    VT_VEC_PUTCHAR test (expect ABC): ABC
+;    VT_VEC_PUTCHAR register canary: OK (D1/D2 preserved)
+;    VT_VEC_PRINTSTR test: Hello from VT_VEC_PRINTSTR!
+;    VT_VEC_PRINTSTR register canary: OK (D1/D2 preserved)
+;    VT_VEC_CLR_ROW test:
+;    (after CLR_ROW canary result)
+;    VT_VEC_HANDLE_LF test: calling 3x - expect 3 blank lines below:
+;
+;
+;
+;    Cursor here after 3 LF calls
+;    VT_VEC_HANDLE_LF register canary: OK (D2 preserved)
+;    >>> THIS LINE WILL BE CLEARED <<<
+;    Press any key to clear the line above...
+;    (line clears)
+;    VT_VEC_CLR_ROW register canary: OK (D2 preserved)
+;    VT_VEC_STREAM_START + VT_VEC_STREAM_CHAR test:
+;    Streaming "HELLO STREAM" directly to VRAM: HELLO STREAM
+;    VT_VEC_STREAM register canary: OK (D2 preserved)
+;    VT_VEC_CLR_EOL test: press any key...
+;    (after CLR_EOL result)
+;    VT_VEC_CLR_EOS test: 5 lines will appear, press key to erase them all
+;    >>> WILL BE CLEARED <<<  (x5 lines)
+;    (press key - all 5 lines vanish)
+;    VT_VEC_CLR_EOS register canary: OK (D1/D2 preserved)
+;    KEEP THIS [blank to col 79]
+;    VT_VEC_CLR_EOL register canary: OK (D1/D2 preserved)
+;    VT_VEC_CLRSCR test: press any key to clear screen...
+;    (press key - screen clears - next output appears at top-left)
+;    VT_VEC_CLRSCR: OK - screen cleared, cursor at top-left
+;    VT_VEC_CLRSCR register canary: OK (D1/D2 preserved)
+;
+;******************************************************************************
+
+; Standard API entry points (routing handled by firmware)
+PRINTSTR_VEC    EQU     $0412
+GETCHAR_VEC     EQU     $040C
+CMD_LOOP_VEC    EQU     $041E
+
+; VERA extended API - RAM jump thunks (VERA must be initialized before calling)
+VT_VEC_PUTCHAR  EQU     $02004100   ; D0.B = char; preserves all regs
+VT_VEC_PRINTSTR EQU     $02004108   ; A0 = NUL-terminated string; A0 walks past NUL
+VT_VEC_CLRSCR   EQU     $02004110   ; no args; clears all 64 rows, cursor to (0,0)
+VT_VEC_CLR_ROW  EQU     $02004118   ; D1.W = physical row (0-63); preserves D0-D2
+VT_VEC_HANDLE_LF    EQU $02004120   ; no args; advance row+scroll if needed; clobbers D0-D1
+VT_VEC_STREAM_START EQU $02004128   ; no args; set VERA ADDR0 to cursor pos stride=1; clobbers D0-D1
+VT_VEC_STREAM_CHAR  EQU $02004130   ; D0.B = char; write char+attr to VERA DATA0; clobbers D0
+VT_VEC_CLR_EOL      EQU $02004168   ; no args; clear cursor col to col 79; preserves all (MOVEM D0-D2)
+VT_VEC_CLR_EOS      EQU $02004170   ; no args; CLR_EOL + clear all rows below; preserves all (MOVEM D0-D2)
+
+; CCB fields (read-only from user code)
+VT_CUR_COL      EQU     $02000300   ; Word - current cursor column (0-79)
+VT_CUR_ROW      EQU     $02000302   ; Word - current write row in tilemap
+
+; VERA control block
+VT_MAGIC        EQU     $02000306   ; Word - $A55A if VERA initialized
+VT_MAGIC_VAL    EQU     $A55A
+
+; NVRAM working copy
+CONFIG_BUF      EQU     $02004096
+NV_CONSOLE_OUT  EQU     16          ; byte offset in CONFIG_BUF; bit 0 = VERA output
+
+        ORG     $02050000
+
+START:
+        ; =====================================================================
+        ; System info header - uses standard API (works on serial or VERA)
+        ; =====================================================================
+
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE.S   .vera_absent
+        LEA     STR_VERA_YES,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .vera_done
+.vera_absent:
+        LEA     STR_VERA_NO,A0
+        JSR     PRINTSTR_VEC
+.vera_done:
+
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ.S   .mode_serial
+        LEA     STR_MODE_VERA,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .mode_done
+.mode_serial:
+        LEA     STR_MODE_RS232,A0
+        JSR     PRINTSTR_VEC
+.mode_done:
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; =====================================================================
+        ; VERA required - bail if VERA not initialized or console not in VERA mode
+        ; =====================================================================
+
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE     .no_vera
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ     .no_vera
+        BRA.S   .vera_ok
+
+.no_vera:
+        LEA     STR_NEED_VERA,A0
+        JSR     PRINTSTR_VEC
+        JMP     CMD_LOOP_VEC
+
+.vera_ok:
+
+        ; =====================================================================
+        ; VT_VEC_PUTCHAR test
+        ;
+        ; VERA_PUTCHAR internals: MOVEM.L D0-D2/A0,-(SP) ... MOVEM.L (SP)+,...
+        ; so D0-D2 and A0 are fully preserved by the routine itself.
+        ; Canaries on D1/D2 verify this on hardware.
+        ; =====================================================================
+
+        LEA     STR_PUTCHAR_HDR,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_PUTCHAR test (expect ABC): "
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries - loaded just before test calls
+        MOVE.L  #$CAFEBABE,D2
+
+        MOVE.B  #'A',D0
+        JSR     VT_VEC_PUTCHAR
+        MOVE.B  #'B',D0
+        JSR     VT_VEC_PUTCHAR
+        MOVE.B  #'C',D0
+        JSR     VT_VEC_PUTCHAR
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC            ; PRINTSTR preserves D1/D2, canaries still valid
+
+        ; Check canaries
+        LEA     STR_PUTCHAR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .putchar_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .putchar_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .putchar_done
+.putchar_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.putchar_done:
+
+        ; =====================================================================
+        ; VT_VEC_PRINTSTR test
+        ;
+        ; VERA_PRINTSTR loops calling VERA_PUTCHAR until NUL.
+        ; VERA_PUTCHAR saves/restores D0-D2/A0, so D1/D2 survive the loop.
+        ; A0 walks past the NUL on return (same as standard PRINTSTR).
+        ; =====================================================================
+
+        LEA     STR_PRINTSTR_HDR,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_PRINTSTR test: "
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries
+        MOVE.L  #$CAFEBABE,D2
+
+        LEA     STR_PRINTSTR_MSG,A0
+        JSR     VT_VEC_PRINTSTR         ; <-- test call
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; Check canaries
+        LEA     STR_PRINTSTR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .printstr_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .printstr_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .printstr_done
+.printstr_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.printstr_done:
+
+        ; =====================================================================
+        ; VT_VEC_CLR_ROW test
+        ;
+        ; Input: D1.W = physical row to clear (0-63).
+        ; VERA_CLR_ROW saves/restores D0-D2, so D1 is restored to the row
+        ; number passed in. Canary is on D2 (D1 is the input param).
+        ;
+        ; Strategy: print a visible marker line, read VT_CUR_ROW from the CCB
+        ; to find which row it landed on (current row - 1 after the CRLF),
+        ; then ask for keypress and clear that exact row.
+        ; =====================================================================
+
+        LEA     STR_CLR_ROW_HDR,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_CLR_ROW test:"
+
+        LEA     STR_CLR_ROW_MARKER,A0
+        JSR     PRINTSTR_VEC            ; ">>> THIS LINE WILL BE CLEARED <<<" + CRLF
+
+        ; VT_CUR_ROW now points to the row after the marker (CRLF advanced it).
+        ; Marker row = (VT_CUR_ROW - 1) & $3F
+        MOVE.W  VT_CUR_ROW,D5
+        SUBQ.W  #1,D5
+        ANDI.W  #$3F,D5                 ; D5 = marker row; safe scratch, not touched by API
+
+        LEA     STR_CLR_ROW_PROMPT,A0
+        JSR     PRINTSTR_VEC            ; "Press any key to clear the line above..."
+
+        JSR     GETCHAR_VEC             ; wait for keypress
+
+        MOVE.L  #$CAFEBABE,D2           ; canary (D1 is input param, not canary)
+        MOVE.W  D5,D1                   ; D1.W = row to clear
+
+        JSR     VT_VEC_CLR_ROW          ; <-- test call
+
+        LEA     STR_CLR_ROW_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .clr_row_fail
+        LEA     STR_CANARY_OK_D2,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .clr_row_done
+.clr_row_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.clr_row_done:
+
+        ; =====================================================================
+        ; VT_VEC_HANDLE_LF test
+        ;
+        ; No inputs. Advances VT_CUR_ROW by 1, clears VT_CUR_COL, hardware-
+        ; scrolls if the viewport is full. Clobbers D0 and D1 (no save/restore
+        ; in the routine itself). D2 is safe - canary here.
+        ;
+        ; Visual test: call 3x in a row - produces 3 blank lines between the
+        ; "before" marker and the "after" marker.
+        ; =====================================================================
+
+        LEA     STR_HANDLE_LF_HDR,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_HANDLE_LF test: calling 3x..."
+
+        MOVE.L  #$CAFEBABE,D2           ; canary
+
+        JSR     VT_VEC_HANDLE_LF        ; advance row 1
+        JSR     VT_VEC_HANDLE_LF        ; advance row 2
+        JSR     VT_VEC_HANDLE_LF        ; advance row 3
+
+        LEA     STR_HANDLE_LF_AFTER,A0
+        JSR     PRINTSTR_VEC            ; "Cursor here after 3 LF calls"
+
+        LEA     STR_HANDLE_LF_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .handle_lf_fail
+        LEA     STR_CANARY_OK_D2,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .handle_lf_done
+.handle_lf_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.handle_lf_done:
+
+        ; =====================================================================
+        ; VT_VEC_STREAM_START + VT_VEC_STREAM_CHAR test
+        ;
+        ; STREAM_START sets VERA ADDR0 to current cursor pos, stride=1.
+        ; Each STREAM_CHAR writes D0.B + current attr directly to VERA DATA0.
+        ; VERA auto-increments ADDR0 after each byte, so char+attr pairs land
+        ; in consecutive VRAM cells automatically.
+        ;
+        ; Important: STREAM_CHAR does NOT update VT_CUR_COL. The CCB cursor
+        ; stays stale after streaming. Advance the line with VT_VEC_PUTCHAR
+        ; CR/LF - PUTCHAR saves/restores D0-D2 so D2 canary survives.
+        ;
+        ; Clobbers: STREAM_START clobbers D0-D1; STREAM_CHAR clobbers D0.
+        ; D2 is safe throughout - canary here.
+        ; =====================================================================
+
+        LEA     STR_STREAM_HDR,A0
+        JSR     PRINTSTR_VEC            ; header + CRLF; cursor now at col 0 of new row
+
+        MOVE.L  #$CAFEBABE,D2           ; canary
+
+        JSR     VT_VEC_STREAM_START     ; point VERA ADDR0 at cursor pos
+
+        MOVE.B  #'H',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'E',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'L',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'L',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'O',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #' ',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'S',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'T',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'R',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'E',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'A',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'M',D0
+        JSR     VT_VEC_STREAM_CHAR
+
+        ; Advance to next line - PUTCHAR saves/restores D0-D2, so D2 canary safe
+        MOVE.B  #$0D,D0
+        JSR     VT_VEC_PUTCHAR
+        MOVE.B  #$0A,D0
+        JSR     VT_VEC_PUTCHAR
+
+        ; Check canary
+        LEA     STR_STREAM_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .stream_fail
+        LEA     STR_CANARY_OK_D2,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .stream_done
+.stream_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.stream_done:
+
+        ; =====================================================================
+        ; VT_VEC_CLR_EOL test
+        ;
+        ; No args. Clears from VT_CUR_COL to col 79 on the current row.
+        ; Does NOT move the cursor. Saves/restores D0-D2 via MOVEM - D1/D2
+        ; canaries are fully valid.
+        ;
+        ; Visual test: print "KEEP THIS " (no CRLF, cursor at col 10), then
+        ; call CLR_EOL. The rest of the line (cols 10-79) goes blank.
+        ; =====================================================================
+
+        LEA     STR_CLR_EOL_PROMPT,A0
+        JSR     PRINTSTR_VEC            ; "press any key..." + CRLF
+
+        LEA     STR_CLR_EOL_BEFORE,A0
+        JSR     PRINTSTR_VEC            ; "KEEP THIS " - no CRLF, cursor stays at col 10
+
+        ; Write ">>> CLEARED <<<" directly to VRAM via streaming - does NOT
+        ; advance VT_CUR_COL, so cursor stays at col 10. CLR_EOL will then
+        ; erase this text, proving it actually cleared something visible.
+        JSR     VT_VEC_STREAM_START     ; ADDR0 -> col 10; clobbers D0-D1
+        MOVE.B  #'>',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'>',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'>',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #' ',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'C',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'L',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'E',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'A',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'R',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'E',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'D',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #' ',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'<',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'<',D0
+        JSR     VT_VEC_STREAM_CHAR
+        MOVE.B  #'<',D0
+        JSR     VT_VEC_STREAM_CHAR
+
+        ; Screen now shows: "KEEP THIS >>> CLEARED <<<" with cursor at col 10.
+        ; Wait for keypress, then CLR_EOL wipes the streamed text.
+        JSR     GETCHAR_VEC             ; clobbers D0 only
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries - loaded after stream ops
+        MOVE.L  #$CAFEBABE,D2
+
+        JSR     VT_VEC_CLR_EOL          ; <-- test call; cols 10-79 go blank
+
+        ; Advance to next line - PUTCHAR saves/restores D0-D2
+        MOVE.B  #$0D,D0
+        JSR     VT_VEC_PUTCHAR
+        MOVE.B  #$0A,D0
+        JSR     VT_VEC_PUTCHAR
+
+        ; Check canaries
+        LEA     STR_CLR_EOL_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .clr_eol_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .clr_eol_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .clr_eol_done
+.clr_eol_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.clr_eol_done:
+
+        ; =====================================================================
+        ; VT_VEC_CLR_EOS test
+        ;
+        ; No args. Calls CLR_EOL on current row, then CLR_ROW on every row
+        ; below to the viewport bottom. Does NOT move the cursor.
+        ; Saves/restores D0-D2 via MOVEM - D1/D2 canaries fully valid.
+        ;
+        ; Visual test: print 5 identical "target" lines, then back the cursor
+        ; up to the top of that block via direct CCB write (in real code use
+        ; GOTOXY), wait for keypress, call CLR_EOS - all 5 lines vanish.
+        ;
+        ; Note: VERA_PRINTSTR preserves A0 on the VERA path, so the same LEA
+        ; + repeated JSR pattern prints the same line multiple times cleanly.
+        ; =====================================================================
+
+        LEA     STR_CLR_EOS_HDR,A0
+        JSR     PRINTSTR_VEC            ; header + instructions
+
+        ; Save current row - this is where the 5 target lines will start
+        MOVE.W  VT_CUR_ROW,D5          ; D5 = anchor row; safe scratch, API won't touch it
+
+        ; Print 5 identical target lines - reload A0 each time (PRINTSTR advances A0)
+        LEA     STR_CLR_EOS_LINE,A0
+        JSR     PRINTSTR_VEC
+        LEA     STR_CLR_EOS_LINE,A0
+        JSR     PRINTSTR_VEC
+        LEA     STR_CLR_EOS_LINE,A0
+        JSR     PRINTSTR_VEC
+        LEA     STR_CLR_EOS_LINE,A0
+        JSR     PRINTSTR_VEC
+        LEA     STR_CLR_EOS_LINE,A0
+        JSR     PRINTSTR_VEC
+
+        ; Reposition cursor to anchor row via direct CCB write.
+        ; In real code use GOTOXY (VT_VEC_GOTOXY) which also hides the cursor
+        ; at the old position. Here we write directly for test purposes.
+        MOVE.W  D5,VT_CUR_ROW
+        CLR.W   VT_CUR_COL
+
+        ; Wait for keypress - no output here; screen shows 5 target lines
+        JSR     GETCHAR_VEC             ; clobbers D0 only; D5 safe
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries - loaded after all setup
+        MOVE.L  #$CAFEBABE,D2
+
+        JSR     VT_VEC_CLR_EOS          ; <-- test call; anchor row to bottom goes blank
+                                        ; cursor stays at (D5, 0) - print result there directly
+
+        ; Check canaries
+        LEA     STR_CLR_EOS_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .clr_eos_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .clr_eos_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .clr_eos_done
+.clr_eos_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.clr_eos_done:
+
+        ; =====================================================================
+        ; VT_VEC_CLRSCR test - KEEP THIS LAST, it clears the screen
+        ;
+        ; VERA_CLRSCR saves/restores D0-D1 internally. VERA_CLR_ROW (called
+        ; in a loop inside CLRSCR) saves/restores D0-D2. So D0-D2 all survive.
+        ; After the call the screen is blank and cursor is at (0,0) - the next
+        ; print will appear at the top-left corner.
+        ; =====================================================================
+
+        LEA     STR_CLRSCR_HDR,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_CLRSCR test: press any key to clear screen..."
+
+        JSR     GETCHAR_VEC             ; wait for keypress before clearing
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries - loaded after GETCHAR (clobbers D0 only)
+        MOVE.L  #$CAFEBABE,D2
+
+        JSR     VT_VEC_CLRSCR           ; <-- test call; screen blanks, cursor -> (0,0)
+
+        ; First print after clear appears at top-left
+        LEA     STR_CLRSCR_OK,A0
+        JSR     PRINTSTR_VEC            ; "VT_VEC_CLRSCR: OK - screen cleared, cursor at top-left"
+
+        ; Check canaries
+        LEA     STR_CLRSCR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .clrscr_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .clrscr_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .clrscr_done
+.clrscr_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.clrscr_done:
+
+        JMP     CMD_LOOP_VEC
+
+
+; =====================================================================
+; Strings
+; =====================================================================
+
+STR_VERA_YES:
+        DC.B    "VERA: detected | console: ",0
+STR_VERA_NO:
+        DC.B    "VERA: not detected | console: ",0
+STR_MODE_VERA:
+        DC.B    "VERA",13,10,0
+STR_MODE_RS232:
+        DC.B    "RS232",13,10,0
+
+STR_NEED_VERA:
+        DC.B    "ERROR: VERA not active.",13,10
+        DC.B    "Switch console to VERA mode with the V command, then retry.",13,10,0
+
+STR_PUTCHAR_HDR:
+        DC.B    "VT_VEC_PUTCHAR test (expect ABC): ",0
+
+STR_PUTCHAR_CANARY:
+        DC.B    "VT_VEC_PUTCHAR register canary: ",0
+
+STR_PRINTSTR_HDR:
+        DC.B    "VT_VEC_PRINTSTR test: ",0
+
+STR_PRINTSTR_MSG:
+        DC.B    "Hello from VT_VEC_PRINTSTR!",0
+
+STR_PRINTSTR_CANARY:
+        DC.B    "VT_VEC_PRINTSTR register canary: ",0
+
+STR_STREAM_HDR:
+        DC.B    "VT_VEC_STREAM_START + VT_VEC_STREAM_CHAR test:",13,10
+        DC.B    "Streaming ""HELLO STREAM"" directly to VRAM: ",0
+
+STR_STREAM_CANARY:
+        DC.B    "VT_VEC_STREAM register canary: ",0
+
+STR_HANDLE_LF_HDR:
+        DC.B    "VT_VEC_HANDLE_LF test: calling 3x - expect 3 blank lines below:",13,10,0
+
+STR_HANDLE_LF_AFTER:
+        DC.B    "Cursor here after 3 LF calls",13,10,0
+
+STR_HANDLE_LF_CANARY:
+        DC.B    "VT_VEC_HANDLE_LF register canary: ",0
+
+STR_CLR_EOS_HDR:
+        DC.B    "VT_VEC_CLR_EOS test: 5 lines will appear below.",13,10
+        DC.B    "Press any key to erase them all to bottom of screen.",13,10,0
+
+STR_CLR_EOS_LINE:
+        DC.B    ">>> WILL BE CLEARED <<<",13,10,0
+
+STR_CLR_EOS_CANARY:
+        DC.B    "VT_VEC_CLR_EOS register canary: ",0
+
+STR_CLR_EOL_PROMPT:
+        DC.B    "VT_VEC_CLR_EOL test: streams '>>> CLEARED <<<' past cursor, press key to erase it...",13,10,0
+
+STR_CLR_EOL_BEFORE:
+        DC.B    "KEEP THIS ",0          ; no CRLF - cursor stays at col 10
+
+STR_CLR_EOL_CANARY:
+        DC.B    "VT_VEC_CLR_EOL register canary: ",0
+
+STR_CLR_ROW_HDR:
+        DC.B    "VT_VEC_CLR_ROW test:",13,10,0
+
+STR_CLR_ROW_MARKER:
+        DC.B    ">>> THIS LINE WILL BE CLEARED <<<",13,10,0
+
+STR_CLR_ROW_PROMPT:
+        DC.B    "Press any key to clear the line above...",13,10,0
+
+STR_CLR_ROW_CANARY:
+        DC.B    "VT_VEC_CLR_ROW register canary: ",0
+
+STR_CANARY_OK_D2:
+        DC.B    "OK (D2 preserved)",13,10,0
+
+STR_CLRSCR_HDR:
+        DC.B    "VT_VEC_CLRSCR test: press any key to clear screen...",13,10,0
+
+STR_CLRSCR_OK:
+        DC.B    "VT_VEC_CLRSCR: OK - screen cleared, cursor at top-left",13,10,0
+
+STR_CLRSCR_CANARY:
+        DC.B    "VT_VEC_CLRSCR register canary: ",0
+
+STR_CANARY_OK:
+        DC.B    "OK (D1/D2 preserved)",13,10,0
+
+STR_CANARY_FAIL:
+        DC.B    "FAIL (register clobbered!)",13,10,0
+
+CRLF:
+        DC.B    13,10,0

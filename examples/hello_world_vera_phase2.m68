@@ -1,0 +1,396 @@
+;******************************************************************************
+;
+;  hello_world_vera_phase2.m68 - VERA extended API test program (phase 2)
+;
+;  Continues testing VT_VEC_* calls from where phase 1 left off.
+;  All phase 1 calls verified on hardware 06-APR-2026.
+;
+;  Tests covered in this file (add one at a time as each is verified):
+;    [x] VT_VEC_GOTOXY      - happy face bounce test (1000 cycles) - VERIFIED 06-APR-2026
+;    [x] VT_VEC_SET_ATTR    - print three lines in different colors, restore, canary check - VERIFIED 06-APR-2026
+;    [x] VT_VEC_CURSOR_ON   - known working (interactive console uses it) - VERIFIED
+;    [x] VT_VEC_CURSOR_OFF  - known working (interactive console uses it) - VERIFIED
+;    [x] VT_VEC_SCROLL_UP   - known working (normal console output relies on it) - VERIFIED
+;    [ ] VT_VEC_SCROLL_DOWN - print 40 numbered lines to scroll buffer, then scroll back
+;
+;  Assemble: vasmm68k_mot.exe -m68020 -Fsrec -o hello_world_vera_phase2.s19 hello_world_vera_phase2.m68
+;  Load:     L at AGFA-MON prompt, paste .s19, then G 02050000
+;
+;  Expected output (VERA mode):
+;    VERA: detected | console: VERA
+;    (screen clears)
+;    Happy face (CP437 $01) drawn along a bouncing path for 1000 positions.
+;    Bottom row: "Bounce: 1000 cycles done  press any key"
+;
+;******************************************************************************
+
+; Standard API entry points
+PUTCHAR_VEC     EQU     $0406
+PRINTSTR_VEC    EQU     $0412
+GETCHAR_VEC     EQU     $040C
+CMD_LOOP_VEC    EQU     $041E
+GETTICKS_VEC    EQU     $0424
+
+; VERA extended API - RAM jump thunks (VERA must be initialized before calling)
+VT_VEC_CLRSCR   EQU     $02004110   ; no args; clears all 64 rows, cursor to (0,0)
+VT_VEC_GOTOXY   EQU     $02004138   ; D0.W=col (0-79), D1.W=row (0-63 physical);
+                                    ; clobbers D0, D2, A0 (via CURSOR_FORCE_OFF)
+VT_VEC_PUTCHAR  EQU     $02004100   ; D0.B=char; preserves all (MOVEM D0-D2/A0)
+VT_VEC_SET_ATTR     EQU     $02004140   ; D0.B=new attr byte; sets VT_TEXT_ATTR in CCB
+VT_VEC_SCROLL_DOWN  EQU     $02004160   ; no args; scroll viewport back (up on screen)
+
+; VERA control block
+VT_MAGIC        EQU     $02000306   ; Word - $A55A if VERA initialized
+VT_MAGIC_VAL    EQU     $A55A
+VT_TEXT_ATTR    EQU     $02000308   ; Byte - current text attribute (fg/bg nibbles)
+VT_VIEW_H       EQU     $02000309   ; Byte - visible viewport height in rows
+
+; NVRAM working copy
+CONFIG_BUF      EQU     $02004096
+NV_CONSOLE_OUT  EQU     16
+
+; CP437 characters
+SMILEY          EQU     $01         ; happy face (CP437 character 1)
+
+        ORG     $02050000
+
+START:
+        ; =====================================================================
+        ; System info header
+        ; =====================================================================
+
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE.S   .vera_absent
+        LEA     STR_VERA_YES,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .vera_done
+.vera_absent:
+        LEA     STR_VERA_NO,A0
+        JSR     PRINTSTR_VEC
+.vera_done:
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ.S   .mode_serial
+        LEA     STR_MODE_VERA,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .mode_done
+.mode_serial:
+        LEA     STR_MODE_RS232,A0
+        JSR     PRINTSTR_VEC
+.mode_done:
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; =====================================================================
+        ; VERA required check
+        ; =====================================================================
+
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE     .no_vera
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ     .no_vera
+        BRA.S   .vera_ok
+.no_vera:
+        LEA     STR_NEED_VERA,A0
+        JSR     PRINTSTR_VEC
+        JMP     CMD_LOOP_VEC
+
+.vera_ok:
+
+        ; =====================================================================
+        ; VT_VEC_GOTOXY bounce test
+        ;
+        ; Draws CP437 happy face ($01) at each position of a bouncing path
+        ; for 1000 cycles. No erasure - path is left on screen.
+        ;
+        ; Register map (all safe - no API touches D3-D7):
+        ;   D3.W = x (col, 0-79)
+        ;   D4.W = y (row, 0 to VIEW_H-1)
+        ;   D5.W = dx (+1 or -1)
+        ;   D6.W = dy (+1 or -1)
+        ;   D7.W = DBRA counter (999 = 1000 iterations)
+        ;
+        ; GOTOXY clobbers D0, D2, A0 (via CURSOR_FORCE_OFF).
+        ; PUTCHAR preserves all (MOVEM D0-D2/A0 save/restore).
+        ; D0/D1 used freely as scratch in bounce logic.
+        ; =====================================================================
+
+        JSR     VT_VEC_CLRSCR           ; clear screen; scroll reset to 0
+
+        ; Initial state: top-left corner, moving down-right
+        CLR.W   D3                      ; x = 0
+        CLR.W   D4                      ; y = 0
+        MOVE.W  #1,D5                   ; dx = +1
+        MOVE.W  #1,D6                   ; dy = +1
+        MOVE.W  #999,D7                 ; DBRA counter: 999 → 0 = 1000 iterations
+
+.bounce_loop:
+        ; Draw smiley at (x, y)
+        MOVE.W  D3,D0
+        MOVE.W  D4,D1
+        JSR     VT_VEC_GOTOXY
+        MOVE.B  #SMILEY,D0
+        JSR     VT_VEC_PUTCHAR
+
+        ; Advance position
+        ADD.W   D5,D3                   ; x += dx
+        ADD.W   D6,D4                   ; y += dy
+
+        ; Bounce x on left edge (x < 0)
+        TST.W   D3
+        BGE.S   .x_right
+        NEG.W   D3                      ; x = -x (e.g. -1 → 1)
+        NEG.W   D5                      ; flip dx
+
+        ; Bounce x on right edge (x >= 80)
+.x_right:
+        CMPI.W  #80,D3
+        BLT.S   .y_top
+        MOVE.W  #158,D0                 ; 158 = 2 * 79
+        SUB.W   D3,D0
+        MOVE.W  D0,D3                   ; x = 158 - x  (e.g. 80 → 78)
+        NEG.W   D5                      ; flip dx
+
+        ; Bounce y on top edge (y < 0)
+.y_top:
+        TST.W   D4
+        BGE.S   .y_bottom
+        NEG.W   D4                      ; y = -y
+        NEG.W   D6                      ; flip dy
+
+        ; Bounce y on bottom edge (y >= VIEW_H)
+.y_bottom:
+        MOVEQ   #0,D0
+        MOVE.B  VT_VIEW_H,D0            ; D0 = VIEW_H
+        CMP.W   D0,D4
+        BLT.S   .bounce_next
+        ; y = 2*(VIEW_H-1) - y
+        ADD.W   D0,D0                   ; D0 = 2*VIEW_H
+        SUBQ.W  #2,D0                   ; D0 = 2*(VIEW_H-1)
+        SUB.W   D4,D0
+        MOVE.W  D0,D4                   ; y reflected
+        NEG.W   D6                      ; flip dy
+
+.bounce_next:
+        DBRA    D7,.bounce_loop
+
+        ; =====================================================================
+        ; Done - move cursor to last viewport row and prompt
+        ; =====================================================================
+
+        MOVEQ   #0,D0
+        MOVE.B  VT_VIEW_H,D0
+        SUBQ.W  #1,D0                   ; last visible row = VIEW_H - 1
+        MOVE.W  D0,D1
+        CLR.W   D0                      ; col = 0
+        JSR     VT_VEC_GOTOXY
+
+        LEA     STR_BOUNCE_DONE,A0
+        JSR     PRINTSTR_VEC
+
+        JSR     GETCHAR_VEC
+
+        ; =====================================================================
+        ; VT_VEC_SET_ATTR test
+        ;
+        ; Prints three lines each in a different text attribute, then restores
+        ; the original attribute and verifies via canary.
+        ;
+        ; VT_TEXT_ATTR nibbles: [7:4]=bg color index, [3:0]=fg color index
+        ; Test attrs:
+        ;   $21 = bg=2, fg=1  (first alt color pair)
+        ;   $51 = bg=5, fg=1  (second alt color pair)
+        ;   original          (restored from D3)
+        ;
+        ; Register map:
+        ;   D3.B = saved original VT_TEXT_ATTR (canary; safe from GOTOXY clobber)
+        ;
+        ; SET_ATTR: VERA_SET_ATTR = MOVE.B D0,VT_TEXT_ATTR / RTS.
+        ;   Only writes to CCB RAM - no VERA hardware access, no IPL needed.
+        ;   Trashes nothing.
+        ; =====================================================================
+
+        ; Clear screen (with Issue #12 IPL workaround)
+        ORI.W   #$0100,SR
+        JSR     VT_VEC_CLRSCR
+        ANDI.W  #$F8FF,SR
+
+        ; Save original attribute in D3
+        MOVE.B  VT_TEXT_ATTR,D3
+
+        ; Row 0: default attribute
+        MOVE.W  #0,D0
+        MOVE.W  #0,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_ATTR_LINE1,A0
+        JSR     PRINTSTR_VEC
+
+        ; Row 1: attribute $21
+        MOVE.B  #$21,D0
+        JSR     VT_VEC_SET_ATTR
+        MOVE.W  #0,D0
+        MOVE.W  #1,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_ATTR_LINE2,A0
+        JSR     PRINTSTR_VEC
+
+        ; Row 2: attribute $51
+        MOVE.B  #$51,D0
+        JSR     VT_VEC_SET_ATTR
+        MOVE.W  #0,D0
+        MOVE.W  #2,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_ATTR_LINE3,A0
+        JSR     PRINTSTR_VEC
+
+        ; Restore original attribute
+        MOVE.B  D3,D0
+        JSR     VT_VEC_SET_ATTR
+        MOVE.W  #0,D0
+        MOVE.W  #3,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_ATTR_RESTORED,A0
+        JSR     PRINTSTR_VEC
+
+        ; Canary: VT_TEXT_ATTR must equal saved D3
+        MOVE.W  #0,D0
+        MOVE.W  #4,D1
+        JSR     VT_VEC_GOTOXY
+        MOVE.B  VT_TEXT_ATTR,D0
+        CMP.B   D3,D0
+        BEQ.S   .attr_ok
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .attr_done
+.attr_ok:
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+.attr_done:
+        JSR     GETCHAR_VEC
+
+        ; =====================================================================
+        ; VT_VEC_SCROLL_DOWN test
+        ;
+        ; Prints 40 numbered lines to push content up past the top of the
+        ; viewport, then scrolls back through them 15 times with a ~333ms
+        ; delay between each scroll so the motion is visible.
+        ;
+        ; Register map (safe across all calls in this section):
+        ;   D3.W = line counter (1..40)
+        ;   D4.L = tick target for delay loop
+        ;   D5.W = scroll counter (15..0)
+        ;   D1.W = tens digit scratch (after DIVU; preserved by PUTCHAR)
+        ;   D2.W = units digit scratch (after DIVU/SWAP; preserved by PUTCHAR)
+        ;
+        ; SCROLL_DOWN: saves/restores D0-D1 internally. D2-D7 safe.
+        ; PUTCHAR ($0406): VERA path saves/restores D0-D2/A0. D3-D7 safe.
+        ; GETTICKS ($0424): clobbers D0 only. D1-D7 safe.
+        ; DIVU trashes D0 (quotient+remainder). D1-D7 untouched by DIVU itself.
+        ; =====================================================================
+
+        ; Clear screen with Issue #12 workaround
+        ORI.W   #$0700,SR
+        JSR     VT_VEC_CLRSCR
+        ANDI.W  #$F8FF,SR
+
+        ; Print 40 numbered lines: "Line 01" .. "Line 40"
+        MOVE.W  #1,D3
+.fill_loop:
+        LEA     STR_LINE_PREFIX,A0
+        JSR     PRINTSTR_VEC        ; prints "Line "
+
+        ; Compute and print two-digit line number via DIVU
+        MOVEQ   #0,D0
+        MOVE.W  D3,D0               ; D0.L = line number
+        DIVU    #10,D0              ; D0[15:0]=quotient(tens), D0[31:16]=remainder(units)
+        MOVE.W  D0,D1               ; D1.W = tens digit
+        SWAP    D0
+        MOVE.W  D0,D2               ; D2.W = units digit
+
+        MOVEQ   #0,D0
+        MOVE.B  D1,D0
+        ADD.B   #'0',D0
+        JSR     PUTCHAR_VEC         ; print tens digit
+
+        MOVEQ   #0,D0
+        MOVE.B  D2,D0
+        ADD.B   #'0',D0
+        JSR     PUTCHAR_VEC         ; print units digit
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ADDQ.W  #1,D3
+        CMPI.W  #41,D3
+        BLT.S   .fill_loop
+
+        ; Prompt before scrolling back
+        LEA     STR_SCROLL_PROMPT,A0
+        JSR     PRINTSTR_VEC
+        JSR     GETCHAR_VEC
+
+        ; Scroll back 15 times, ~333ms between each (20 ticks @ 60Hz)
+        MOVE.W  #15,D5
+.scroll_back:
+        JSR     VT_VEC_SCROLL_DOWN
+
+        JSR     GETTICKS_VEC        ; D0 = current tick
+        ADD.L   #20,D0              ; target = now + 20 ticks
+        MOVE.L  D0,D4
+.sd_wait:
+        JSR     GETTICKS_VEC
+        CMP.L   D4,D0
+        BLT.S   .sd_wait
+
+        SUBQ.W  #1,D5
+        BNE.S   .scroll_back
+
+        LEA     STR_SCROLL_DONE,A0
+        JSR     PRINTSTR_VEC
+        JSR     GETCHAR_VEC
+        JMP     CMD_LOOP_VEC
+
+
+; =====================================================================
+; Strings
+; =====================================================================
+
+STR_VERA_YES:
+        DC.B    "VERA: detected | console: ",0
+STR_VERA_NO:
+        DC.B    "VERA: not detected | console: ",0
+STR_MODE_VERA:
+        DC.B    "VERA",13,10,0
+STR_MODE_RS232:
+        DC.B    "RS232",13,10,0
+
+STR_NEED_VERA:
+        DC.B    "ERROR: VERA not active.",13,10
+        DC.B    "Switch console to VERA mode with the V command, then retry.",13,10,0
+
+STR_BOUNCE_DONE:
+        DC.B    "Bounce: 1000 cycles done  press any key",0
+
+STR_ATTR_LINE1:
+        DC.B    "Line 1: default attribute",0
+STR_ATTR_LINE2:
+        DC.B    "Line 2: attribute $21 (bg=2 fg=1)",0
+STR_ATTR_LINE3:
+        DC.B    "Line 3: attribute $51 (bg=5 fg=1)",0
+STR_ATTR_RESTORED:
+        DC.B    "Line 4: original attribute restored",0
+STR_CANARY_OK:
+        DC.B    "SET_ATTR canary OK",0
+STR_CANARY_FAIL:
+        DC.B    "SET_ATTR canary FAIL",0
+
+STR_LINE_PREFIX:
+        DC.B    "Line ",0
+STR_SCROLL_PROMPT:
+        DC.B    "--- 40 lines printed. Press any key to scroll back ---",13,10,0
+STR_SCROLL_DONE:
+        DC.B    "Scroll done. Press any key.",0
+
+CRLF:
+        DC.B    13,10,0

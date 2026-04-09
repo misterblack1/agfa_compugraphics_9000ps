@@ -1,0 +1,172 @@
+;******************************************************************************
+;
+;  agfa-basic.m68 - EhBASIC 68K v3.54 hardware wrapper for Agfa 9000PS
+;
+;  Included from agfa-mon.m68 at ORG $001500.
+;  I/O uses Z85C30 SCC Channel A via the monitor jump table.
+;
+;  The core EhBASIC engine is in ehbasic68k.inc, extracted from
+;  ../ioboard/basic/basic68k-rom.m68 by build.ps1 (lines 193 onwards).
+;
+;  EhBASIC RAM variables are accessed as offsets from A3 (ram_strt).
+;  We convert the original DS-based layout to EQU constants so no binary
+;  output is generated in the $0000 region (which we use for ROM vectors).
+;
+;******************************************************************************
+
+; ─── EhBASIC RAM variable offsets (from A3 / ram_strt) ─────────────────────
+; Computed from basic68k-rom.inc DS layout. No binary output.
+
+ram_strt        EQU     $0000   ; base (256-byte stack area)
+ram_base        EQU     $0100   ; start of BASIC RAM variables proper
+LAB_WARM        EQU     $0100   ; warm start entry  (word)
+Wrmjpv          EQU     $0102   ; warm start vector (long)
+Usrjmp          EQU     $0106   ; USR() JMP opcode  (word)
+Usrjpv          EQU     $0108   ; USR() vector      (long)
+V_INPT          EQU     $010C   ; VEC_IN entry      (word)
+V_INPTv         EQU     $010E   ; VEC_IN vector     (long)
+V_OUTP          EQU     $0112   ; VEC_OUT entry     (word)
+V_OUTPv         EQU     $0114   ; VEC_OUT vector    (long)
+V_LOAD          EQU     $0118   ; VEC_LD entry      (word)
+V_LOADv         EQU     $011A   ; VEC_LD vector     (long)
+V_SAVE          EQU     $011E   ; VEC_SV entry      (word)
+V_SAVEv         EQU     $0120   ; VEC_SV vector     (long)
+V_CTLC          EQU     $0124   ; CTRL-C entry      (word)
+V_CTLCv         EQU     $0126   ; CTRL-C vector     (long)
+Itemp           EQU     $012A   ; temp integer      (long)
+Smeml           EQU     $012E   ; start of memory   (long)
+Sfncl           EQU     $0132   ; start of functions (long)
+Svarl           EQU     $0136   ; start of variables (long)
+Sstrl           EQU     $013A   ; start of strings  (long)
+Sarryl          EQU     $013E   ; start of arrays   (long)
+Earryl          EQU     $0142   ; end of arrays     (long)
+Sstorl          EQU     $0146   ; string storage    (long)
+Ememl           EQU     $014A   ; end of memory     (long)
+Sutill          EQU     $014E   ; string utility ptr (long)
+Clinel          EQU     $0152   ; current line      (long)
+Blinel          EQU     $0156   ; break line        (long)
+Cpntrl          EQU     $015A   ; continue pointer  (long)
+Dlinel          EQU     $015E   ; DATA line         (long)
+Dptrl           EQU     $0162   ; DATA pointer      (long)
+Rdptrl          EQU     $0166   ; read pointer      (long)
+Varname         EQU     $016A   ; current var name  (long)
+Cvaral          EQU     $016E   ; current var addr  (long)
+Lvarpl          EQU     $0172   ; var pointer LET/FOR (long)
+des_sk_e        EQU     $0176   ; descriptor stack end (6 longs = 24 bytes)
+des_sk          EQU     $018E   ; descriptor stack start (word + ...)
+Ibuffs          EQU     $0190   ; input buffer start ($20 longs = 128 bytes)
+Ibuffe          EQU     $0210   ; input buffer end
+FAC1_m          EQU     $0210   ; FAC1 mantissa1    (long)
+FAC1_e          EQU     $0214   ; FAC1 exponent     (word)
+FAC1_s          EQU     FAC1_e+1 ; FAC1 sign (b7)
+FAC2_m          EQU     $0218   ; FAC2 mantissa1    (long)
+FAC2_e          EQU     $021C   ; FAC2 exponent     (long)
+FAC2_s          EQU     FAC2_e+1 ; FAC2 sign (b7)
+FAC_sc          EQU     FAC2_e+2 ; sign comparison
+flag            EQU     FAC2_e+3 ; divide flag
+PRNlword        EQU     $0220   ; PRNG seed         (long)
+ut1_pl          EQU     $0224   ; utility pointer 1 (long)
+Asptl           EQU     $0228   ; array size/ptr    (long)
+Astrtl          EQU     $022C   ; array start ptr   (long)
+numexp          EQU     Astrtl   ; string→float exponent count
+expcnt          EQU     Astrtl+1 ; exponent count
+expneg          EQU     Astrtl+3 ; exponent negative flag
+func_l          EQU     $0230   ; function pointer  (long)
+Defdim          EQU     $0234   ; default DIM flag  (word)
+cosout          EQU     Defdim   ; CORDIC output flag (reuse)
+Dtypef          EQU     Defdim+1 ; data type flag
+Binss           EQU     $0236   ; bin string start  (4 longs = 16 bytes)
+Decss           EQU     $0246   ; decimal string start (long + word = 6 bytes)
+Usdss           EQU     $024C   ; unsigned decimal  (word)
+Hexss           EQU     $024E   ; hex string start  (2 longs = 8 bytes)
+BHsend          EQU     $0256   ; bin/dec/hex end   (word)
+prstk           EQU     $0258   ; stacked fn index  (byte)
+tpower          EQU     $0259   ; CORDIC power      (byte)
+Asrch           EQU     $025A   ; scan-between-quotes (byte)
+Dimcnt          EQU     $025B   ; dimension count   (byte)
+Breakf          EQU     $025C   ; break flag        (byte)
+Oquote          EQU     $025D   ; open quote flag   (byte)
+Gclctd          EQU     $025E   ; garbage collected (byte)
+Sufnxf          EQU     $025F   ; subscript/FNX flag (byte)
+Imode           EQU     $0260   ; input mode        (byte)
+Cflag           EQU     $0261   ; comparison flag   (byte)
+TabSiz          EQU     $0262   ; TAB step size     (byte)
+comp_f          EQU     $0263   ; compare function  (byte)
+Nullct          EQU     $0264   ; null count        (byte)
+TPos            EQU     $0265   ; terminal position (byte)
+TWidth          EQU     $0266   ; terminal width    (byte)
+Iclim           EQU     $0267   ; input column lim  (byte)
+ccflag          EQU     $0268   ; CTRL-C check flag (byte)
+ccbyte          EQU     $0269   ; CTRL-C last byte  (byte)
+ccnull          EQU     $026A   ; CTRL-C timer      (byte)
+prg_strt        EQU     $026C   ; (even aligned after ccnull)
+
+; RAM allocation for EhBASIC on Agfa
+ram_addr        EQU     $02008000   ; BASIC RAM base (256KB area in main RAM)
+ram_size        EQU     $00040000   ; 256KB
+
+
+; ─── Hardware constants ───────────────────────────────────────────────────────
+; Z85C30 Channel A (via A3-relative EhBASIC variable vectors)
+SCC_A_CTRL_B    EQU     $07000002
+SCC_A_DATA_B    EQU     $07000003
+
+; Monitor jump table addresses (same as agfa-mon.m68 jump table)
+PUTCHAR_API     EQU     $0406
+GETCHAR_API     EQU     $040C
+EXIT_VEC_B      EQU     $041E
+
+
+;******************************************************************************
+;  BASIC_START - entry point from CMD_BASIC (JMP BASIC_START)
+;  Placed at ORG $001500 by agfa-mon.m68
+;******************************************************************************
+
+BASIC_START:
+        BRA.W   code_start          ; jump over hardware vectors to init code
+
+
+;******************************************************************************
+;  Hardware I/O vectors (EhBASIC calls these via RAM jump table at A3+offset)
+;
+;  VEC_OUT: output character in D0.b
+;  VEC_IN:  non-blocking input - D0.b = char, carry set if char ready,
+;           carry clear if no char (EhBASIC polls this in a loop)
+;******************************************************************************
+
+VEC_OUT:
+        JMP     PUTCHAR_API         ; delegate to monitor PUTCHAR at $0406
+
+VEC_IN:
+        BTST    #0,SCC_A_CTRL_B     ; RR0 bit 0 = Rx character available?
+        BEQ.S   .nochr
+        MOVE.B  SCC_A_DATA_B,D0    ; read character
+        ANDI.B  #$7F,D0             ; mask to 7-bit ASCII
+        ORI.B   #1,CCR              ; carry set = character available
+        RTS
+.nochr  ANDI.B  #$FE,CCR           ; carry clear = no character
+        RTS
+
+VEC_LD:
+VEC_SV:
+        MOVEQ   #$2E,D7             ; error $2E = not implemented
+        BRA     LAB_XERR            ; warm-start with error (defined in core)
+
+
+;******************************************************************************
+;  code_start - EhBASIC initialisation
+;  Pass RAM base in A0, size in D0, then fall into LAB_COLD
+;******************************************************************************
+
+code_start:
+        MOVEA.L #ram_addr,A0        ; tell EhBASIC where its RAM is
+        MOVE.L  #ram_size,D0        ; tell EhBASIC how big the RAM is
+        ; falls directly into LAB_COLD (first label in ehbasic68k.inc)
+
+
+;******************************************************************************
+;  EhBASIC core engine
+;  Extracted from ../ioboard/basic/basic68k-rom.m68 lines 193-end by build.ps1
+;******************************************************************************
+
+        INCLUDE "ehbasic68k.inc"

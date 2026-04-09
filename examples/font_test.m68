@@ -1,0 +1,307 @@
+;******************************************************************************
+;
+;  font_test.m68 - VERA Font Test Program
+;
+;  Displays all 256 characters, then cycles through 3 alternative fonts.
+;  Requires VERA initialized and console mode 1 (VERA output enabled).
+;
+;  Keys during font cycle:
+;    Space  - next font (wraps around)
+;    U      - use current font and exit
+;    Q      - revert to stock font and exit
+;
+;  API calls used:
+;    VT_VEC_CLRSCR   ($02004110) - clear screen (with interrupts disabled)
+;    VT_VEC_GOTOXY   ($02004138) - cursor positioning (works after CLRSCR
+;                                   resets scroll to 0)
+;    VT_VEC_CLR_EOL  ($02004168) - clear to end of line
+;    PRINTSTR_VEC    ($0412)     - text output
+;    GETCHAR_VEC     ($040C)     - key input
+;    CMD_LOOP_VEC    ($041E)     - exit to monitor
+;
+;  Direct VRAM access for:
+;    - Character grid (all 256 chars, bypasses control-char interpretation)
+;    - Font loading (LOAD_FONT writes to VRAM $0F000)
+;
+;  Assemble: vasmm68k_mot.exe -m68020 -Fsrec -o font_test.s19 font_test.m68
+;  Load:     L at AGFA-MON prompt, paste .s19, then G 02050000
+;
+;******************************************************************************
+
+PRINTSTR_VEC    EQU     $0412
+GETCHAR_VEC     EQU     $040C
+CMD_LOOP_VEC    EQU     $041E
+
+VT_VEC_CLRSCR   EQU     $02004110
+VT_VEC_GOTOXY   EQU     $02004138
+VT_VEC_CLR_EOL  EQU     $02004168
+
+VT_MAGIC        EQU     $02000306
+VT_MAGIC_VAL    EQU     $A55A
+VT_TEXT_ATTR    EQU     $02000308
+
+VT_VERA_BASE    EQU     $04000020
+
+CONFIG_BUF      EQU     $02004096
+NV_CONSOLE_OUT  EQU     16
+
+ROW_SEP         EQU     5
+ROW_TITLE       EQU     6
+ROW_PROMPT      EQU     7
+
+        ORG     $02050000
+
+START:
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE     .no_vera
+
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ     .no_console
+
+        ; --- Clear screen with interrupts disabled ---
+
+        ORI.W   #$0700,SR
+        JSR     VT_VEC_CLRSCR
+        ANDI.W  #$F8FF,SR
+
+        ; --- Write 256-char grid directly to VRAM ---
+        ;     4 rows of 64 chars, starting at row 0 col 8
+
+        MOVE.B  VT_TEXT_ATTR,D4
+        LEA     VT_VERA_BASE,A0
+        MOVEQ   #0,D5
+        MOVEQ   #0,D6
+
+.grid_row:
+        MOVE.L  D6,D0
+        LSL.L   #8,D0
+        ADDI.L  #16,D0
+        MOVE.B  #$00,5(A0)
+        MOVE.B  D0,0(A0)
+        LSR.L   #8,D0
+        MOVE.B  D0,1(A0)
+        MOVE.B  #$10,2(A0)
+        MOVEQ   #63,D7
+
+.grid_col:
+        MOVE.B  D5,3(A0)
+        MOVE.B  D4,3(A0)
+        ADDQ.B  #1,D5
+        TST.B   D5
+        BEQ     .grid_done
+        DBF     D7,.grid_col
+        ADDQ.W  #1,D6
+        BRA     .grid_row
+
+.grid_done:
+        ; --- Row 5: separator ---
+
+        ORI.W   #$0700,SR
+        CLR.W   D0
+        MOVE.W  #ROW_SEP,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_SEP,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+
+        ; --- Row 6: title ---
+
+        CLR.W   D0
+        MOVE.W  #ROW_TITLE,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_TITLE,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+
+        ; --- Row 7: press key ---
+
+        CLR.W   D0
+        MOVE.W  #ROW_PROMPT,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_PRESSKEY,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+        ANDI.W  #$F8FF,SR
+
+        JSR     GETCHAR_VEC
+
+        ; --- Font cycling loop ---
+        ;     D6 = font index (0..2), wraps
+
+        MOVEQ   #0,D6
+
+.font_loop:
+        MOVE.W  D6,D7
+        LSL.W   #2,D7
+
+        LEA     FONT_PTRS,A2
+        MOVE.L  0(A2,D7.W),A1
+        BSR     LOAD_FONT
+
+        ; Row 6: font name
+
+        ORI.W   #$0700,SR
+        CLR.W   D0
+        MOVE.W  #ROW_TITLE,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     FONT_NAMES,A2
+        MOVE.L  0(A2,D7.W),A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+
+.font_reprompt:
+        ; Row 7: prompt
+
+        CLR.W   D0
+        MOVE.W  #ROW_PROMPT,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_FONT_PROMPT,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+        ANDI.W  #$F8FF,SR
+
+        JSR     GETCHAR_VEC
+
+        CMPI.B  #$20,D0
+        BEQ     .next_font
+        CMPI.B  #'U',D0
+        BEQ     .use_font
+        CMPI.B  #'u',D0
+        BEQ     .use_font
+        CMPI.B  #'Q',D0
+        BEQ     .quit_font
+        CMPI.B  #'q',D0
+        BEQ     .quit_font
+        BRA     .font_reprompt
+
+.next_font:
+        ADDQ.B  #1,D6
+        CMPI.B  #3,D6
+        BNE     .font_loop
+        MOVEQ   #0,D6
+        BRA     .font_loop
+
+.use_font:
+        ORI.W   #$0700,SR
+        CLR.W   D0
+        MOVE.W  #ROW_PROMPT,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_USING,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+        ANDI.W  #$F8FF,SR
+        JMP     CMD_LOOP_VEC
+
+.quit_font:
+        LEA     FONT_STOCK,A1
+        BSR     LOAD_FONT
+
+        ORI.W   #$0700,SR
+        CLR.W   D0
+        MOVE.W  #ROW_TITLE,D1
+        JSR     VT_VEC_GOTOXY
+        LEA     STR_RESTORED,A0
+        JSR     PRINTSTR_VEC
+        JSR     VT_VEC_CLR_EOL
+
+        CLR.W   D0
+        MOVE.W  #ROW_PROMPT,D1
+        JSR     VT_VEC_GOTOXY
+        JSR     VT_VEC_CLR_EOL
+        ANDI.W  #$F8FF,SR
+        JMP     CMD_LOOP_VEC
+
+.no_vera:
+        LEA     STR_NO_VERA,A0
+        JSR     PRINTSTR_VEC
+        JMP     CMD_LOOP_VEC
+
+.no_console:
+        LEA     STR_NO_CONSOLE,A0
+        JSR     PRINTSTR_VEC
+        JMP     CMD_LOOP_VEC
+
+;******************************************************************************
+;  LOAD_FONT - Write 2048 bytes from A1 into VERA VRAM $0F000
+;
+;  Input:  A1 = pointer to font data (2048 bytes)
+;  Trashes: D0-D1, A0-A1
+;******************************************************************************
+
+LOAD_FONT:
+        LEA     VT_VERA_BASE,A0
+        MOVE.B  #$00,5(A0)
+        MOVE.B  #$00,0(A0)
+        MOVE.B  #$F0,1(A0)
+        MOVE.B  #$10,2(A0)
+        MOVE.W  #2047,D1
+.lf_lp  MOVE.B  (A1)+,3(A0)
+        DBRA    D1,.lf_lp
+        RTS
+
+;******************************************************************************
+;  Strings
+;******************************************************************************
+
+STR_NO_VERA:
+        DC.B    "ERROR: VERA not initialized!",13,10,0
+        ALIGN   2
+STR_NO_CONSOLE:
+        DC.B    "ERROR: Console not in VERA mode!",13,10,0
+        ALIGN   2
+STR_SEP:
+        DC.B    "------------------------------------------------------------------------------",0
+        ALIGN   2
+STR_TITLE:
+        DC.B    "Font Test - All 256 Characters (current font)",0
+        ALIGN   2
+STR_PRESSKEY:
+        DC.B    "Press any key to begin font cycle...",0
+        ALIGN   2
+STR_FONT_PROMPT:
+        DC.B    "[Space] Next  [U] Use this font  [Q] Quit",0
+        ALIGN   2
+STR_USING:
+        DC.B    "Font selected. Exiting.",0
+        ALIGN   2
+STR_RESTORED:
+        DC.B    "Stock font restored. Exiting.",0
+        ALIGN   2
+
+;******************************************************************************
+;  Font pointer/name tables
+;******************************************************************************
+
+FONT_PTRS:
+        DC.L    FONT_APRICOT
+        DC.L    FONT_EAGLE
+        DC.L    FONT_MBYTE
+
+FONT_NAMES:
+        DC.L    STR_FONT1
+        DC.L    STR_FONT2
+        DC.L    STR_FONT3
+
+STR_FONT1:
+        DC.B    "Font: Apricot Portable",0
+        ALIGN   2
+STR_FONT2:
+        DC.B    "Font: Eagle SpCGA Alt3",0
+        ALIGN   2
+STR_FONT3:
+        DC.B    "Font: MByte PC230 CGA",0
+        ALIGN   4
+
+;******************************************************************************
+;  Font data (each 2048 bytes: 256 chars x 8 bytes/char)
+;******************************************************************************
+
+FONT_STOCK:
+        INCBIN  "agfa-monitor/vera/font_code437_8x8.bin"
+FONT_APRICOT:
+        INCBIN  "fonts/ApricotPortable.bin"
+FONT_EAGLE:
+        INCBIN  "fonts/EagleSpCGA_Alt3.bin"
+FONT_MBYTE:
+        INCBIN  "fonts/MBytePC230_CGA.bin"

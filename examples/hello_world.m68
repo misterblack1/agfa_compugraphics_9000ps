@@ -1,0 +1,425 @@
+;******************************************************************************
+;
+;  hello_world.m68 - API test: PRINTSTR, PUTCHAR, register canaries
+;
+;  Tests run on both VERA and serial. VERA detection only gates the
+;  SET_ATTR calls - all other tests always execute.
+;
+;  Assemble: vasmm68k_mot.exe -m68020 -Fsrec -o hello_world.s19 hello_world.m68
+;  Load:     L at AGFA-MON prompt, paste .s19, then G 02050000
+;
+;  Expected output:
+;    PRINTSTR test: Hello world!
+;    PRINTSTR register canary: OK (D0/D1/D2 preserved)
+;    PUTCHAR test (expect ABC): ABC
+;    PUTCHAR register canary: OK (D1/D2 preserved)
+;
+;******************************************************************************
+
+; API entry points
+PUTCHAR_VEC     EQU     $0406
+PRINTSTR_VEC    EQU     $0412
+GETCHAR_VEC     EQU     $040C
+GETLINE_VEC     EQU     $0418
+CMD_LOOP_VEC    EQU     $041E
+GETTICKS_VEC    EQU     $0424
+
+; VERA extended API vectors
+VT_VEC_SET_ATTR EQU     $02004140   ; D0.B = attr (hi nibble=bg, lo nibble=fg)
+
+; VERA control block
+VT_MAGIC        EQU     $02000306   ; Word - $A55A if VERA initialized
+VT_MAGIC_VAL    EQU     $A55A
+
+; NVRAM working copy
+CONFIG_BUF      EQU     $02004096
+NV_CONSOLE_OUT  EQU     16          ; byte offset in CONFIG_BUF; bit 0 = VERA output
+NV_TEXT_ATTR    EQU     $0F         ; byte offset in CONFIG_BUF; default text attribute
+
+        ORG     $02050000
+
+START:
+        ; =====================================================================
+        ; System info header
+        ; =====================================================================
+
+        ; VERA detected?
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE.S   .vera_absent
+        LEA     STR_VERA_YES,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .vera_done
+.vera_absent:
+        LEA     STR_VERA_NO,A0
+        JSR     PRINTSTR_VEC
+.vera_done:
+
+        ; Console mode?
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ.S   .mode_serial
+        LEA     STR_MODE_VERA,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .mode_done
+.mode_serial:
+        LEA     STR_MODE_RS232,A0
+        JSR     PRINTSTR_VEC
+.mode_done:
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; =====================================================================
+        ; PRINTSTR test
+        ; =====================================================================
+
+        ; Print the section label (not part of the canary test)
+        LEA     STR_PRINTSTR_HDR,A0
+        JSR     PRINTSTR_VEC            ; prints "PRINTSTR test: "
+
+        ; =====================================================================
+        ; Print "Hello world!" - with color if VERA active, plain if serial
+        ; Load canaries BEFORE this call; check AFTER - this is what's tested.
+        ; =====================================================================
+
+        MOVE.L  #$12345678,D0           ; canaries loaded just before the test call
+        MOVE.L  #$DEADBEEF,D1
+        MOVE.L  #$CAFEBABE,D2
+
+        ; VERA check 1: console output set to VERA?
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ     .hello_plain
+
+        ; VERA check 2: VERA initialized?
+        MOVE.W  VT_MAGIC,D1
+        CMPI.W  #VT_MAGIC_VAL,D1
+        BNE     .hello_plain
+
+        ; VERA active - set color, print, restore color
+        MOVE.B  #$61,D0
+        JSR     VT_VEC_SET_ATTR
+
+        MOVE.L  #$12345678,D0           ; load canaries
+        MOVE.L  #$DEADBEEF,D1
+        MOVE.L  #$CAFEBABE,D2
+
+        LEA     MESSAGE,A0
+        JSR     PRINTSTR_VEC            ; <-- canary test call
+
+        ; Re-read NVRAM attr directly - avoids register conflict with canaries
+        MOVE.B  CONFIG_BUF+NV_TEXT_ATTR,D0
+        JSR     VT_VEC_SET_ATTR
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .hello_done
+
+.hello_plain:
+        LEA     MESSAGE,A0
+        JSR     PRINTSTR_VEC            ; <-- canary test call
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+.hello_done:
+        ; Check canaries after the MESSAGE printstr call
+        LEA     STR_PRINTSTR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$12345678,D0
+        BNE.S   .printstr_fail
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .printstr_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .printstr_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .printstr_done
+.printstr_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.printstr_done:
+
+        ; =====================================================================
+        ; PUTCHAR test
+        ; =====================================================================
+
+        LEA     STR_PUTCHAR_HDR,A0
+        JSR     PRINTSTR_VEC            ; prints "PUTCHAR test (expect ABC): "
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries
+        MOVE.L  #$CAFEBABE,D2
+
+        MOVE.B  #'A',D0
+        JSR     PUTCHAR_VEC
+        MOVE.B  #'B',D0
+        JSR     PUTCHAR_VEC
+        MOVE.B  #'C',D0
+        JSR     PUTCHAR_VEC
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; Check canaries
+        LEA     STR_PUTCHAR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .putchar_fail
+        CMPI.L  #$CAFEBABE,D2
+        BNE.S   .putchar_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .putchar_done
+.putchar_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.putchar_done:
+
+        ; =====================================================================
+        ; GETTICKS test
+        ; =====================================================================
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries - D0 will be clobbered by GETTICKS
+        MOVE.L  #$CAFEBABE,D2
+
+        JSR     GETTICKS_VEC            ; D0.L = tick count
+
+        ; Check canaries IMMEDIATELY before any print calls clobber D1/D2
+        MOVE.L  D0,D3                   ; save tick count in D3
+        MOVEQ   #0,D4                   ; D4 = 0 (pass)
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .getticks_bad
+        CMPI.L  #$CAFEBABE,D2
+        BEQ.S   .getticks_checked
+.getticks_bad:
+        MOVEQ   #1,D4                   ; D4 = 1 (fail)
+.getticks_checked:
+
+        LEA     STR_GETTICKS_HDR,A0
+        JSR     PRINTSTR_VEC            ; "GETTICKS test: "
+
+        BSR     PRINT_DECIMAL           ; print D3 as decimal
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        LEA     STR_GETTICKS_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        TST.L   D4
+        BNE.S   .getticks_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .getticks_done
+.getticks_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.getticks_done:
+
+        ; =====================================================================
+        ; GETCHAR test
+        ; =====================================================================
+
+        LEA     STR_GETCHAR_HDR,A0
+        JSR     PRINTSTR_VEC            ; "GETCHAR test (press a key): "
+
+        MOVE.L  #$DEADBEEF,D1           ; canaries
+        MOVE.L  #$CAFEBABE,D2
+
+        JSR     GETCHAR_VEC             ; blocks until keypress; D0.B = char
+
+        ; Check canaries immediately before print clobbers D1/D2
+        MOVE.L  D0,D3                   ; save received char
+        MOVEQ   #0,D4                   ; D4 = 0 (pass)
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .getchar_bad
+        CMPI.L  #$CAFEBABE,D2
+        BEQ.S   .getchar_checked
+.getchar_bad:
+        MOVEQ   #1,D4
+.getchar_checked:
+
+        ; Echo the received character
+        MOVE.L  D3,D0
+        JSR     PUTCHAR_VEC
+
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; Print canary result
+        LEA     STR_GETCHAR_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        TST.L   D4
+        BNE.S   .getchar_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .getchar_done
+.getchar_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.getchar_done:
+        LEA     STR_GETCHAR_CONFIRM,A0
+        JSR     PRINTSTR_VEC            ; "GETCHAR: The key pushed was "
+        MOVE.L  D3,D0                   ; D3 still holds the received char
+        JSR     PUTCHAR_VEC
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        ; =====================================================================
+        ; GETLINE test
+        ; =====================================================================
+
+        LEA     STR_GETLINE_HDR,A0
+        JSR     PRINTSTR_VEC            ; "GETLINE test (type a line + Enter): "
+
+        MOVE.L  #$12345678,D0           ; canaries - all should survive GETLINE
+        MOVE.L  #$DEADBEEF,D1
+        MOVE.L  #$CAFEBABE,D2
+
+        LEA     GETLINE_BUF,A0
+        JSR     GETLINE_VEC             ; blocks until Enter; fills GETLINE_BUF
+
+        ; IMPORTANT: GETLINE does NOT return a character count in D0.
+        ; D0 is saved on entry and restored on exit. The canary value
+        ; $12345678 must survive unchanged - verified on hardware 06-APR-2026.
+        ; To get the line length after this call, scan GETLINE_BUF for NUL.
+        ; This is a known API limitation; a future ROM revision could return
+        ; the count in D0 but would require a reflash.
+        MOVEQ   #0,D3                   ; D3 = 0 (pass)
+        CMPI.L  #$12345678,D0
+        BNE.S   .getline_bad
+        CMPI.L  #$DEADBEEF,D1
+        BNE.S   .getline_bad
+        CMPI.L  #$CAFEBABE,D2
+        BEQ.S   .getline_checked
+.getline_bad:
+        MOVEQ   #1,D3                   ; D3 = 1 (fail)
+.getline_checked:
+
+        LEA     STR_GETLINE_CANARY,A0
+        JSR     PRINTSTR_VEC
+
+        TST.L   D3
+        BNE.S   .getline_fail
+        LEA     STR_CANARY_OK,A0
+        JSR     PRINTSTR_VEC
+        BRA.S   .getline_canary_done
+.getline_fail:
+        LEA     STR_CANARY_FAIL,A0
+        JSR     PRINTSTR_VEC
+.getline_canary_done:
+
+        ; Echo the line back
+        LEA     STR_GETLINE_CONFIRM,A0
+        JSR     PRINTSTR_VEC            ; "GETLINE: The line entered was "
+        LEA     GETLINE_BUF,A0
+        JSR     PRINTSTR_VEC
+        LEA     CRLF,A0
+        JSR     PRINTSTR_VEC
+
+        JMP     CMD_LOOP_VEC
+
+
+; =====================================================================
+; PRINT_DECIMAL - print D3.L as unsigned decimal
+;
+; Builds digit characters right-to-left in DEC_BUF using repeated
+; divide-by-10 (68020 DIVU.L), then calls PRINTSTR.
+;
+; Input:    D3.L = value to print
+; Clobbers: D0 (via PRINTSTR), D3 (consumed), D4
+; Preserves: D1, D2, D5-D7, A0-A6
+; =====================================================================
+PRINT_DECIMAL:
+        MOVEM.L D4/A0-A1,-(SP)
+
+        LEA     DEC_BUF+11,A1           ; A1 = one past end of 11-char buffer
+        CLR.B   (A1)                    ; NUL terminator
+
+        TST.L   D3
+        BNE.S   .pd_loop
+        MOVE.B  #'0',-(A1)              ; special case: zero
+        BRA.S   .pd_print
+
+.pd_loop:
+        TST.L   D3
+        BEQ.S   .pd_print
+        CLR.L   D4                      ; D4 = high 32 bits of dividend (must be 0)
+        DIVU.L  #10,D4:D3              ; D3 = quotient, D4 = remainder
+        ADD.B   #'0',D4
+        MOVE.B  D4,-(A1)               ; store digit (building right-to-left)
+        BRA.S   .pd_loop
+
+.pd_print:
+        MOVEA.L A1,A0
+        JSR     PRINTSTR_VEC
+
+        MOVEM.L (SP)+,D4/A0-A1
+        RTS
+
+; =====================================================================
+; Strings
+; =====================================================================
+
+STR_VERA_YES:
+        DC.B    "VERA: detected | console: ",0
+STR_VERA_NO:
+        DC.B    "VERA: not detected | console: ",0
+STR_MODE_VERA:
+        DC.B    "VERA",13,10,0
+STR_MODE_RS232:
+        DC.B    "RS232",13,10,0
+
+STR_PRINTSTR_HDR:
+        DC.B    "PRINTSTR test: ",0
+
+STR_PRINTSTR_CANARY:
+        DC.B    "PRINTSTR register canary: ",0
+
+STR_PUTCHAR_HDR:
+        DC.B    "PUTCHAR test (expect ABC): ",0
+
+STR_PUTCHAR_CANARY:
+        DC.B    "PUTCHAR register canary: ",0
+
+STR_CANARY_OK:
+        DC.B    "OK (D0/D1/D2 preserved)",13,10,0
+
+STR_CANARY_FAIL:
+        DC.B    "FAIL (register clobbered!)",13,10,0
+
+STR_GETCHAR_HDR:
+        DC.B    "GETCHAR test (press a key): ",0
+
+STR_GETCHAR_CANARY:
+        DC.B    "GETCHAR register canary: ",0
+
+STR_GETCHAR_CONFIRM:
+        DC.B    "GETCHAR: The key pushed was ",0
+
+STR_GETTICKS_HDR:
+        DC.B    "GETTICKS test: ",0
+
+STR_GETTICKS_CANARY:
+        DC.B    "GETTICKS register canary: ",0
+
+MESSAGE:
+        DC.B    "Hello world!",0
+
+CRLF:
+        DC.B    13,10,0
+
+STR_GETLINE_HDR:
+        DC.B    "GETLINE test (type a line + Enter): ",0
+
+STR_GETLINE_CANARY:
+        DC.B    "GETLINE register canary: ",0
+
+STR_GETLINE_CONFIRM:
+        DC.B    "GETLINE: The line entered was ",0
+
+DEC_BUF:
+        DS.B    12                      ; 10 digits + NUL + 1 spare
+
+GETLINE_BUF:
+        DS.B    80                      ; GETLINE requires 80-byte buffer

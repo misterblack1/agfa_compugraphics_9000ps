@@ -1,0 +1,305 @@
+;******************************************************************************
+;
+;  EEPROM_DUMP_VERA - High-Speed Streaming Dump (Persistent CCB)
+;
+;  Target CPU : Motorola 68020
+;  Target RAM : $02050000
+;  EEPROM Addr: $02000000 (Stress Test DRAM)
+;  VERA Addr  : $04000020
+;
+;  Optimized for Speed: Uses VERA Stride-1 Streaming.
+;******************************************************************************
+
+EEPROM_BASE     EQU     $02000000       ; DRAM source
+EEPROM_SIZE     EQU     $8000           ; 32KB Dump
+
+; --- MONITOR API ---
+MON_PUTCHAR     EQU     $0406
+EXIT_VEC        EQU     $00041E
+
+; --- VERA Persistent Console Control Block (CCB) ---
+V_VAR_BASE      EQU     $02000300
+V_CUR_COL       EQU     V_VAR_BASE+0
+V_CUR_ROW       EQU     V_VAR_BASE+2
+V_SCROLL_ROW    EQU     V_VAR_BASE+4
+V_MAGIC         EQU     V_VAR_BASE+6
+V_TEXT_ATTR     EQU     V_VAR_BASE+8
+
+V_MAGIC_VAL     EQU     $A55A
+
+        ORG     $02050000
+
+; --- VERA Hardware Registers ---
+VERA_BASE       EQU     $04000020
+VERA_ADDR0_L    EQU     $00
+VERA_ADDR0_M    EQU     $01
+VERA_ADDR0_H    EQU     $02
+VERA_DATA0      EQU     $03
+VERA_CTRL       EQU     $05
+VERA_L0_VSCROLL_L EQU   $12
+VERA_L0_VSCROLL_H EQU   $13
+
+START:
+        MOVEM.L D0-D7/A0-A6,-(SP)
+        
+        ; 1. Initialization Guard
+        MOVE.W  V_MAGIC,D0          ; Load magic word from RAM
+        CMPI.W  #V_MAGIC_VAL,D0     ; Check against $A55A
+        BEQ.S   .init_ok
+        
+        LEA     STR_NOT_INIT,A0
+        BSR.W   PRINT_SERIAL_STR
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        JMP     EXIT_VEC
+
+.init_ok:
+        ; 2. Start from a fresh line on the VERA console
+        MOVE.B  #$0D,D0
+        BSR.W   VERA_PUTCHAR
+        MOVE.B  #$0A,D0
+        BSR.W   VERA_PUTCHAR
+        CLR.W   V_CUR_COL           ; Start at left margin
+
+        LEA     STR_DUMP_START,A0
+        BSR.W   VERA_PRINTSTR_MARGINS
+        
+        MOVEA.L #EEPROM_BASE,A2     ; Source
+        MOVE.L  #EEPROM_SIZE,D7     ; Remaining Bytes
+        
+.row_loop:
+        ; --- BEGIN STREAMING ROW ---
+        ; Set VERA to start of current row at Column 10
+        BSR.W   VERA_STREAM_START
+        
+        ; 1. Print Address (8 Hex)
+        MOVE.L  A2,D0
+        BSR.W   STREAM_HEX8
+        MOVE.B  #':',D0
+        BSR.W   STREAM_CHAR
+        BSR.W   STREAM_SPACE
+        
+        ; 2. Print 16 Data Bytes
+        MOVEQ   #16,D6
+        MOVEA.L A2,A3               ; Temporary pointer for hex pass
+.hex_pass:
+        MOVE.B  (A3)+,D0
+        BSR.W   STREAM_HEX2
+        BSR.W   STREAM_SPACE
+        SUBQ.L  #1,D6
+        BNE.S   .hex_pass
+        
+        ; 3. Print ASCII Sidebar
+        MOVE.B  #'|',D0
+        BSR.W   STREAM_CHAR
+        BSR.W   STREAM_SPACE
+        MOVEQ   #16,D6
+.ascii_pass:
+        MOVE.B  (A2)+,D0            ; Advance A2 here
+        CMPI.B  #$20,D0
+        BLT.S   .dot
+        CMPI.B  #$7E,D0
+        BLE.S   .put_ascii
+.dot:   MOVE.B  #'.',D0
+.put_ascii:
+        BSR.W   STREAM_CHAR
+        SUBQ.L  #1,D6
+        BNE.S   .ascii_pass
+        
+        ; --- END STREAMING ROW ---
+        ; Update CCB and handle scrolling
+        BSR.W   VERA_ADVANCE_ROW
+        CLR.W   V_CUR_COL           ; Reset to column 0
+        
+        SUBI.L  #16,D7
+        BGT.W   .row_loop           ; Loop if more bytes remain
+        
+        ; Final Banner
+        LEA     STR_DONE,A0
+        BSR.W   VERA_PRINTSTR_MARGINS
+        
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        JMP     EXIT_VEC
+
+; =====================================================================
+; HIGH-SPEED STREAMING ROUTINES
+; =====================================================================
+
+; ---------------------------------------------------------------------
+; VERA_STREAM_START
+; ---------------------------------------------------------------------
+; Description: Calculates the VRAM address for the current CCB row 
+;              at Column 10 and sets VERA_ADDR0 with Stride=1.
+; ---------------------------------------------------------------------
+VERA_STREAM_START:
+    MOVE.W  V_CUR_ROW,D0
+    MOVE.L  #0,D1
+    MOVE.W  D0,D1
+    LSL.L   #8,D1                   ; row * 256
+    ; Column 0 (Start at left edge)
+    
+    MOVE.B  #0,VERA_BASE+VERA_CTRL  ; ADDRSEL=0
+    MOVE.B  D1,VERA_BASE+VERA_ADDR0_L
+    LSR.L   #8,D1
+    MOVE.B  D1,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H ; Stride=1, Bank=0
+    RTS
+
+; ---------------------------------------------------------------------
+; STREAM_HEX8 / STREAM_HEX2 / STREAM_CHAR / STREAM_SPACE
+; ---------------------------------------------------------------------
+; These routines pump data directly to VERA_DATA0. 
+; They assume VERA_ADDR0 is already set with Stride=1.
+; ---------------------------------------------------------------------
+STREAM_HEX8:
+    MOVEM.L D1-D2,-(SP)
+    MOVE.L  D0,D1
+    MOVEQ   #7,D2
+.h8_loop:
+    ROL.L   #4,D1
+    MOVE.B  D1,D0
+    BSR.S   STREAM_NYBBLE
+    DBF     D2,.h8_loop
+    MOVEM.L (SP)+,D1-D2
+    RTS
+
+STREAM_HEX2:
+    MOVE.B  D0,-(SP)
+    LSR.B   #4,D0
+    BSR.S   STREAM_NYBBLE
+    MOVE.B  (SP)+,D0
+    BSR.S   STREAM_NYBBLE
+    RTS
+
+STREAM_NYBBLE:
+    ANDI.L  #$0F,D0                 ; Clear entire register for index
+    LEA     HEX_TABLE,A1
+    MOVE.B  (A1,D0.W),D0            ; Get ASCII hex character
+    ; fall through to STREAM_CHAR
+
+STREAM_CHAR:
+    MOVE.B  D0,VERA_BASE+VERA_DATA0 ; ASCII Byte
+    MOVE.B  V_TEXT_ATTR,VERA_BASE+VERA_DATA0 ; Attribute Byte
+    RTS
+
+STREAM_SPACE:
+    MOVE.B  #$20,D0
+    BRA.S   STREAM_CHAR
+
+; ---------------------------------------------------------------------
+; VERA_ADVANCE_ROW
+; ---------------------------------------------------------------------
+; Description: Increments the current CCB row, handles hardware 
+;              scrolling logic, and clears the new line.
+; ---------------------------------------------------------------------
+VERA_ADVANCE_ROW:
+    ADDQ.W  #1,V_CUR_ROW
+    ANDI.W  #$3F,V_CUR_ROW          ; Wrap 64 rows
+    
+    ; Scrolling check
+    MOVE.W  V_CUR_ROW,D0
+    MOVE.W  V_SCROLL_ROW,D1
+    SUB.W   D1,D0
+    ANDI.W  #$3F,D0
+    CMPI.W  #30,D0                  ; Threshold for 240p display (30 lines)
+    BLT.S   .no_scroll
+    
+    ; Scroll Hardware
+    ADDQ.W  #1,V_SCROLL_ROW
+    ANDI.W  #$3F,V_SCROLL_ROW
+    MOVE.W  V_SCROLL_ROW,D0
+    LSL.W   #3,D0                   ; row * 8 pixels
+    MOVE.B  D0,VERA_BASE+VERA_L0_VSCROLL_L
+    LSR.W   #8,D0
+    MOVE.B  D0,VERA_BASE+VERA_L0_VSCROLL_H
+    
+    ; Clear the new row appearing at the bottom (ScrollRow + 20)
+    MOVE.W  V_SCROLL_ROW,D1
+    ADDI.W  #29,D1
+    ANDI.W  #$3F,D1
+    BSR     VERA_CLR_ROW
+.no_scroll:
+    RTS
+
+; =====================================================================
+; UTILITY & SERIAL ROUTINES (LEGACY COMPAT)
+; =====================================================================
+
+PRINT_SERIAL_STR:
+    MOVE.B  (A0)+,D0
+    TST.B   D0
+    BEQ.S   .ps_done
+    JSR     MON_PUTCHAR
+    BRA.S   PRINT_SERIAL_STR
+.ps_done:
+    RTS
+
+VERA_PRINTSTR_MARGINS:
+    MOVE.B  (A0)+,D0
+    TST.B   D0
+    BEQ.S   .vps_done
+    BSR.S   VERA_PUTCHAR
+    BRA.S   VERA_PRINTSTR_MARGINS
+.vps_done:
+    RTS
+
+VERA_PUTCHAR:
+    ; Absolute coordinate logic for non-streaming output (Banner etc.)
+    MOVEM.L D0-D2/A0,-(SP)
+    MOVE.B  D0,D1
+    CMPI.B  #$0D,D1
+    BNE.S   .v_not_cr
+    CLR.W   V_CUR_COL
+    BRA.S   .v_done
+.v_not_cr:
+    CMPI.B  #$0A,D1
+    BNE.S   .v_not_lf
+    BSR     VERA_ADVANCE_ROW
+    CLR.W   V_CUR_COL
+    BRA.S   .v_done
+.v_not_lf:
+    ; Normal Putchar
+    MOVE.W  V_CUR_ROW,D0
+    LSL.L   #8,D0
+    MOVE.W  V_CUR_COL,D2
+    LSL.W   #1,D2
+    ADD.L   D2,D0
+    MOVE.B  #0,VERA_BASE+VERA_CTRL
+    MOVE.B  D0,VERA_BASE+VERA_ADDR0_L
+    LSR.L   #8,D0
+    MOVE.B  D0,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H
+    MOVE.B  D1,VERA_BASE+VERA_DATA0
+    MOVE.B  V_TEXT_ATTR,VERA_BASE+VERA_DATA0
+    ADDQ.W  #1,V_CUR_COL            ; Fixed column advancement for banner
+.v_done:
+    MOVEM.L (SP)+,D0-D2/A0
+    RTS
+
+VERA_CLR_ROW:
+    MOVEM.L D0,-(SP)
+    MOVE.W  D1,D0                   ; D1 = row
+    LSL.L   #8,D0
+    MOVE.B  #0,VERA_BASE+VERA_CTRL
+    MOVE.B  D0,VERA_BASE+VERA_ADDR0_L
+    LSR.L   #8,D0
+    MOVE.B  D0,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H
+    MOVE.W  #127,D0
+.clr_l:
+    MOVE.B  #$20,VERA_BASE+VERA_DATA0
+    MOVE.B  V_TEXT_ATTR,VERA_BASE+VERA_DATA0
+    DBRA    D0,.clr_l
+    MOVEM.L (SP)+,D0
+    RTS
+
+; =====================================================================
+; DATA SECTION
+; =====================================================================
+            EVEN
+HEX_TABLE:  DC.B    "0123456789ABCDEF"
+            EVEN
+STR_DUMP_START: DC.B    "--- STARTING OPTIMIZED 32KB STREAM DUMP ---",$0D,$0A,0
+            EVEN
+STR_NOT_INIT:   DC.B    $0D,$0A,"VERA not initialized, cannot run.",$0D,$0A,0
+            EVEN
+STR_DONE:       DC.B    $0D,$0A,"*** OPTIMIZED DUMP COMPLETE ***",0

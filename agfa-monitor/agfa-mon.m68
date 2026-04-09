@@ -1,0 +1,2187 @@
+;******************************************************************************
+;
+;  AGFA-MON - Machine Language Monitor for Agfa Compugraphic 9000PS
+;
+;  Target CPU : Motorola 68020
+;  Serial I/O : Zilog Z85C30 SCC Channel A (RS-232 DE-9)
+;               Control $07000002 / Data $07000003
+;  ROM        : 128KB at $00000000 (4x AM27C256, 32-bit interleave)
+;  RAM        : 4MB at $02000000-$023FFFFF
+;
+;  Assemble with:
+;    vasmm68k_mot -m68020 -Fbin -o agfa-rom.bin agfa-mon.m68
+;
+;  API jump table (compatible with I/O board for EhBASIC):
+;    $0400  JMP START       cold start
+;    $0406  JMP PUTCHAR     output D0.b to serial
+;    $040C  JMP GETCHAR     blocking input into D0.b
+;    $0412  JMP PRINTSTR    print NUL-terminated string at A0
+;    $0418  JMP GETLINE     read line into buffer at A0
+;    $041E  JMP CMD_LOOP    return to monitor prompt
+;    $0424  JMP GETTICKS    return tick count in D0.L (~60Hz)
+;
+;  Reserved for future API entries: $042A-$045F
+;  START code begins at $0460.
+;
+;******************************************************************************
+
+; ─── Z85C30 SCC ───────────────────────────────────────────────────────────────
+SCC_A_CTRL      EQU     $07000002   ; Ch A control port (RR0 / WRn)
+SCC_A_DATA      EQU     $07000003   ; Ch A data port
+
+; ─── Memory map ───────────────────────────────────────────────────────────────
+STACK_TOP       EQU     $02400000   ; initial supervisor stack (top of 4MB+guard)
+
+; Monitor workspace:
+;   $02004000  LINE_BUF  [80 bytes]
+;   $02004050  SAVE_D0   [32 bytes]  D0-D7
+;   $02004070  SAVE_A0   [28 bytes]  A0-A6
+;   $02004090  SAVE_PC   [ 4 bytes]
+;   $02004094  SAVE_SR   [ 2 bytes]
+;   $02004096  CONFIG_BUF [40 bytes] NVRAM working copy
+;   $02004100  VT_VEC_*  [128 bytes] VERA dispatch JMP thunks
+;   $02004500  VT_RAM    [~5KB]      VERA text routines (copied from ROM)
+
+LINE_BUF        EQU     $02004000
+LINE_BUF_SZ     EQU     80
+SAVE_D0         EQU     $02004050
+SAVE_A0         EQU     $02004070
+SAVE_PC         EQU     $02004090
+SAVE_SR         EQU     $02004094
+CONFIG_BUF      EQU     $02004096   ; 40-byte NVRAM working copy
+
+; NVRAM field offsets into CONFIG_BUF
+NV_CONSOLE_OUT  EQU     16          ; byte: bits[1:0] console I/O mode
+                                    ;   bit 0: 0=serial out  1=VERA out
+                                    ;   bit 1: 0=RS232 in    1=PS/2 in
+
+; EhBASIC area
+BASIC_RAM       EQU     $02008000
+BASIC_SIZE      EQU     $00040000   ; 256KB
+
+; Boot RAM test range
+;   Start: $02008000 - above monitor workspace ($02004000-$02004097)
+;   End:   $023F0000 - leaves 64KB below stack top ($02400000) for headroom
+RAM_TEST_START  EQU     $02008000
+RAM_TEST_END    EQU     $023F0000
+RAM_MAX_ERRS    EQU     8           ; max errors reported per pattern before suppressing
+
+; AM5380 SCSI registers (stride-1 from $05000000)
+SCSI_ODR        EQU     $05000000
+SCSI_ICR        EQU     $05000001
+SCSI_MR         EQU     $05000002
+SCSI_TCR        EQU     $05000003
+SCSI_STATUS     EQU     $05000004
+SCSI_BSR        EQU     $05000005
+SCSI_RESET_REG  EQU     $05000007
+STAT_REQ        EQU     5
+STAT_BSY        EQU     6
+
+; RAM buffer used by ROM SCSI scanner (in CMD_SCSI, no user input needed)
+NS_DATA_BUF     EQU     LINE_BUF    ; 80 bytes - enough for 36-byte INQUIRY/MODE SENSE
+
+
+;******************************************************************************
+;  EXCEPTION VECTOR TABLE   ORG $000000
+;******************************************************************************
+
+        ORG     $000000
+
+        DC.L    STACK_TOP           ; $000 Initial SSP
+        DC.L    START               ; $004 Initial PC
+        DC.L    BUSERR_HANDLER      ; $008 Bus Error
+        DC.L    ADDRERR_HANDLER     ; $00C Address Error
+        DC.L    ILLEGAL_HANDLER     ; $010 Illegal Instruction
+        DC.L    GENERIC_HANDLER     ; $014 Zero Divide
+        DC.L    GENERIC_HANDLER     ; $018 CHK/CHK2
+        DC.L    GENERIC_HANDLER     ; $01C TRAPV
+        DC.L    GENERIC_HANDLER     ; $020 Privilege Violation
+        DC.L    GENERIC_HANDLER     ; $024 Trace
+        DC.L    GENERIC_HANDLER     ; $028 Line 1010 Emulator
+        DC.L    GENERIC_HANDLER     ; $02C Line 1111 Emulator
+        DC.L    GENERIC_HANDLER     ; $030 Hardware Breakpoint
+        DC.L    GENERIC_HANDLER     ; $034 (reserved)
+        DC.L    GENERIC_HANDLER     ; $038 Format Error
+        DC.L    GENERIC_HANDLER     ; $03C Uninitialised Interrupt
+        REPT    8
+        DC.L    GENERIC_HANDLER     ; $040-$05C reserved
+        ENDR
+        DC.L    GENERIC_HANDLER     ; $060 Spurious Interrupt
+        DC.L    GENERIC_HANDLER     ; $064 Level 1 Autovector
+        DC.L    GENERIC_HANDLER     ; $068 Level 2 Autovector
+        DC.L    GENERIC_HANDLER     ; $06C Level 3 Autovector
+        DC.L    GENERIC_HANDLER     ; $070 Level 4 Autovector
+        DC.L    GENERIC_HANDLER     ; $074 Level 5 Autovector
+        DC.L    GENERIC_HANDLER     ; $078 Level 6 Autovector
+        DC.L    GENERIC_HANDLER     ; $07C NMI
+        REPT    16
+        DC.L    GENERIC_HANDLER     ; $080-$0BC TRAP #0-#15
+        ENDR
+        REPT    16
+        DC.L    GENERIC_HANDLER     ; $0C0-$0FC FP + reserved
+        ENDR
+        REPT    192
+        DC.L    GENERIC_HANDLER     ; $100-$3FC User vectors
+        ENDR
+
+
+;******************************************************************************
+;  API JUMP TABLE  - fixed addresses (I/O board compatible)
+;******************************************************************************
+
+        ORG     $000400
+        JMP     START               ; $0400 START_VEC
+        ORG     $000406
+        JMP     PUTCHAR             ; $0406 PUT_VEC
+        ORG     $00040C
+        JMP     GETCHAR             ; $040C GET_VEC
+        ORG     $000412
+        JMP     PRINTSTR            ; $0412 PRT_VEC
+        ORG     $000418
+        JMP     GETLINE             ; $0418 GL_VEC
+        ORG     $00041E
+        JMP     CMD_LOOP            ; $041E EXIT_VEC
+        ORG     $000424
+        JMP     GETTICKS            ; $0424 GETTICKS_VEC
+
+
+;******************************************************************************
+;  START - cold-boot entry point
+;******************************************************************************
+
+        ORG     $000460
+START:
+        MOVE.L  #$0001,D0
+        MOVEC   D0,CACR             ; enable 68020 instruction cache
+        MOVEA.L #STACK_TOP,SP       ; establish supervisor stack
+
+        ; Zero monitor register-save area ($02004050-$02004097, 72 bytes = 18 lwords)
+        MOVEA.L #SAVE_D0,A0
+        MOVE.L  #(SAVE_SR+4-SAVE_D0)/4-1,D0
+.clr    CLR.L   (A0)+
+        DBF     D0,.clr
+
+        ; Hardware register writes -- required before first SCC access.
+        ; Original ROM (detect_ram_top at $1a6e) writes these before TST.B $07000020.
+        ; Without them the PAL controlling the $07000000 region does not assert
+        ; DTACK, causing BERR on every SCC access and an immediate double bus fault.
+        ; Verified: omitting these writes causes halt; adding them fixes it.
+        MOVE.L  #$FFFFFFFF,$06100000    ; rendering controller reset
+        CLR.L   $06080000               ; FIFO/hardware register clear
+        CLR.L   $060C0000               ; FIFO/hardware register clear
+
+        BSR     INIT_HW
+        LEA     STR_BANNER,A0
+        BSR     PRINTSTR
+        LEA     STR_BUILD_VERSION,A0
+        BSR     PRINTSTR
+
+        ; Load NVRAM config
+        BSR     LOAD_CONFIG
+
+        ; Detect and initialize VERA if present
+        BSR     VERA_DETECT
+        TST.B   D0
+        BEQ.S   .no_vera
+
+        ; Temporarily force serial output during VERA init.
+        ; VERA_INIT sets VT_MAGIC but JMP thunks aren't ready until
+        ; VT_INIT_VECTORS completes.  If NV_CONSOLE_OUT bit 0 is set,
+        ; PUTCHAR would redirect to uninitialized thunks → crash.
+        MOVE.B  CONFIG_BUF+NV_CONSOLE_OUT,D3
+        CLR.B   CONFIG_BUF+NV_CONSOLE_OUT
+
+        BSR     VERA_INIT
+        BSR     VT_INIT_RAM
+        BSR     VT_INIT_VECTORS
+
+        MOVE.B  D3,CONFIG_BUF+NV_CONSOLE_OUT   ; restore VERA redirect
+
+        BSR     VERA_IRQ_INIT           ; VSYNC cursor blink + TICK_COUNT
+        BRA.S   .irq_done
+
+.no_vera:
+        BSR     VIA_TIMER_INIT          ; 60Hz tick via VIA #1 T1 (no cursor, no VERA)
+
+.irq_done:
+        BSR     RAM_TEST_BOOT           ; quick AA/55 check before handing off to user
+        LEA     STR_HELP,A0
+        BSR     PRINTSTR
+        ; fall through
+
+
+;******************************************************************************
+;  CMD_LOOP - main command dispatcher
+;******************************************************************************
+
+CMD_LOOP:
+        LEA     STR_PROMPT,A0
+        BSR     PRINTSTR
+        LEA     LINE_BUF,A0
+        BSR     GETLINE             ; A0 = buffer base (unchanged); NUL-terminated
+
+        MOVEA.L A0,A1               ; A1 = parse cursor
+        BSR     SKIP_SPACES_A1
+
+        MOVE.B  (A1)+,D0
+        CMPI.B  #$61,D0             ; fold to upper
+        BLT.S   .uc
+        CMPI.B  #$7A,D0
+        BGT.S   .uc
+        SUBI.B  #$20,D0
+.uc
+        CMP.B   #'H',D0
+        BEQ     CMD_HELP
+        CMP.B   #'?',D0
+        BEQ     CMD_HELP
+        CMP.B   #'D',D0
+        BEQ     CMD_DUMP
+        CMP.B   #'E',D0
+        BEQ     CMD_EXAMINE
+        CMP.B   #'F',D0
+        BEQ     CMD_FILL
+        CMP.B   #'M',D0
+        BEQ     CMD_MOVE
+        CMP.B   #'G',D0
+        BEQ     CMD_GO
+        CMP.B   #'R',D0
+        BEQ     CMD_REGS
+        CMP.B   #'L',D0
+        BEQ     CMD_LOAD
+        CMP.B   #'P',D0
+        BEQ     CMD_PUT
+        CMP.B   #'B',D0
+        BEQ     CMD_BASIC
+        CMP.B   #'S',D0
+        BEQ     CMD_SCSI
+        CMP.B   #'C',D0
+        BEQ     CMD_CPM
+        CMP.B   #'U',D0
+        BEQ     CMD_UNIX
+        CMP.B   #'T',D0
+        BEQ     CMD_TEST
+        CMP.B   #'X',D0
+        BEQ     CMD_XBASIC
+        CMP.B   #'V',D0
+        BEQ     CMD_VERA_CFG
+        CMPI.B  #0,D0
+        BEQ     CMD_LOOP            ; blank line
+        LEA     STR_WHAT,A0
+        BSR     PRINTSTR
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  H / ? - help
+;******************************************************************************
+CMD_HELP:
+        LEA     STR_HELP,A0
+        BSR     PRINTSTR
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  D addr [len] - hex/ASCII dump (default 128 bytes)
+;******************************************************************************
+CMD_DUMP:
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A2               ; A2 = dump address
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1        ; D0 = length
+        TST.L   D0
+        BNE.S   .gl
+        MOVE.L  #$80,D0
+.gl     MOVE.L  D0,D7               ; D7 = bytes remaining
+
+.row    BTST    #0,SCC_A_CTRL       ; any key pressed?
+        BEQ.S   .cnt
+        MOVE.B  SCC_A_DATA,D0      ; discard key, abort dump
+        BRA     CMD_LOOP
+.cnt    TST.L   D7
+        BEQ     CMD_LOOP
+
+        MOVE.L  A2,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #':',D0
+        BSR     PUTCHAR
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+
+        MOVE.L  #16,D5
+        CMP.L   D5,D7
+        BHI.S   .full
+        MOVE.L  D7,D5               ; D5 = bytes this row
+.full   MOVE.L  D5,D4               ; D4 = bytes this row (saved)
+        MOVEA.L A2,A3               ; A3 = row start (ASCII pass)
+        MOVE.L  D5,D6               ; D6 = hex count
+
+.hx     MOVE.B  (A2)+,D0
+        BSR     PRINT_HEX2
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        SUBQ.L  #1,D6
+        BNE.S   .hx
+
+        MOVE.L  #16,D6
+        SUB.L   D4,D6               ; D6 = pad columns
+.pad    TST.L   D6
+        BEQ.S   .asc
+        LEA     STR_3SP,A0
+        BSR     PRINTSTR
+        SUBQ.L  #1,D6
+        BRA.S   .pad
+
+.asc    MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVE.L  D4,D6
+.ac     MOVE.B  (A3)+,D0
+        CMPI.B  #$20,D0
+        BLT.S   .dot
+        CMPI.B  #$7E,D0
+        BLE.S   .pr
+.dot    MOVE.B  #'.',D0
+.pr     BSR     PUTCHAR
+        SUBQ.L  #1,D6
+        BNE.S   .ac
+
+        BSR     PRINT_CRLF
+        SUB.L   D4,D7
+        BRA.W   .row
+
+
+;******************************************************************************
+;  E <addr> - interactive examine/edit memory
+;  Shows address: current_byte, accepts new hex value or Enter to keep.
+;  Type . to quit and return to prompt.
+;******************************************************************************
+CMD_EXAMINE:
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A2               ; A2 = current address
+
+.next   MOVE.L  A2,D0               ; print address
+        BSR     PRINT_HEX8
+        LEA     STR_COLON_SP,A0
+        BSR     PRINTSTR
+        MOVE.B  (A2),D0             ; print current byte
+        BSR     PRINT_HEX2
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+
+        LEA     LINE_BUF,A0         ; read user input into line buffer
+        BSR     GETLINE
+        MOVEA.L A0,A1               ; A1 = parse cursor
+        BSR     SKIP_SPACES_A1
+
+        MOVE.B  (A1),D0             ; check first char
+        BEQ.W   .adv                ; empty line = keep byte, advance
+        CMP.B   #'.',D0
+        BEQ     CMD_LOOP            ; '.' = exit
+        CMP.B   #'q',D0
+        BEQ     CMD_LOOP
+        CMP.B   #'Q',D0
+        BEQ     CMD_LOOP
+
+        BSR     PARSE_HEX_A1        ; parse new value
+        MOVE.B  D0,(A2)             ; write byte
+
+.adv    ADDQ.L  #1,A2
+        BRA.W   .next
+
+
+;******************************************************************************
+;  F addr len byte - fill
+;******************************************************************************
+CMD_FILL:
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A2
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVE.L  D0,D7
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVE.B  D0,D6
+.fl     TST.L   D7
+        BEQ     CMD_LOOP
+        MOVE.B  D6,(A2)+
+        SUBQ.L  #1,D7
+        BRA.S   .fl
+
+
+;******************************************************************************
+;  M src dst len - copy
+;******************************************************************************
+CMD_MOVE:
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A2
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A3
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVE.L  D0,D7
+.ml     TST.L   D7
+        BEQ     CMD_LOOP
+        MOVE.B  (A2)+,(A3)+
+        SUBQ.L  #1,D7
+        BRA.S   .ml
+
+
+;******************************************************************************
+;  G [addr] - execute user code
+;
+;  Restores D0-D7 and A1-A6 from save area.
+;  A0 = call address. User's saved A0 is NOT restored (A0 is the call target).
+;  On return: saves all registers, resets stack, displays register context.
+;******************************************************************************
+CMD_GO:
+        BSR     SKIP_SPACES_A1
+        TST.B   (A1)
+        BEQ.S   .use_saved
+        BSR     PARSE_HEX_A1
+        MOVE.L  D0,SAVE_PC
+.use_saved
+        MOVEA.L SAVE_PC,A0          ; A0 = call target
+        MOVEM.L SAVE_D0,D0-D7       ; restore user D0-D7
+        MOVEM.L SAVE_A0+4,A1-A6    ; restore user A1-A6 (skip A0 slot)
+        JSR     (A0)                ; call user code
+        MOVEM.L D0-D7,SAVE_D0       ; save result D0-D7
+        MOVEM.L A0-A6,SAVE_A0       ; save result A0-A6
+        MOVEA.L #STACK_TOP,SP       ; reset monitor stack
+        LEA     STR_RETURNED,A0
+        BSR     PRINTSTR
+        BRA     CMD_REGS_SHOW
+
+
+;******************************************************************************
+;  R - display registers
+;******************************************************************************
+CMD_REGS:
+CMD_REGS_SHOW:
+        LEA     STR_D_LABEL,A0
+        BSR     PRINTSTR
+        MOVEA.L #SAVE_D0,A2
+        MOVEQ   #7,D7
+.dl     MOVE.L  (A2)+,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        DBF     D7,.dl
+        BSR     PRINT_CRLF
+
+        LEA     STR_A_LABEL,A0
+        BSR     PRINTSTR
+        MOVEA.L #SAVE_A0,A2
+        MOVEQ   #6,D7
+.al     MOVE.L  (A2)+,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        DBF     D7,.al
+        BSR     PRINT_CRLF
+
+        LEA     STR_PC_SR,A0
+        BSR     PRINTSTR
+        MOVE.L  SAVE_PC,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVE.W  SAVE_SR,D0
+        BSR     PRINT_HEX4
+        BSR     PRINT_CRLF
+
+        LEA     STR_CTRL,A0
+        BSR     PRINTSTR
+        MOVEC   VBR,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVEC   CACR,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVEC   ISP,D0
+        BSR     PRINT_HEX8
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVEC   MSP,D0
+        BSR     PRINT_HEX8
+        BSR     PRINT_CRLF
+
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  P <addr> <len> -- output S3 records (memory -> terminal)
+;  Uses S3 (4-byte address) + S7 terminator to match vasm -Fsrec output.
+;******************************************************************************
+CMD_PUT:
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVEA.L D0,A2
+        BSR     SKIP_SPACES_A1
+        BSR     PARSE_HEX_A1
+        MOVE.L  D0,D7
+        TST.L   D7
+        BEQ     CMD_LOOP
+        BSR     EMIT_SRECS
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  EMIT_SRECS -- output S3 records for a memory region, then S7 terminator
+;  Input : A2 = start address, D7 = byte count
+;  Clobbers: A2, D3-D7
+;******************************************************************************
+EMIT_SRECS:
+        MOVE.B  CONFIG_BUF+NV_CONSOLE_OUT,-(SP)
+        CLR.B   CONFIG_BUF+NV_CONSOLE_OUT
+.row    TST.L   D7
+        BEQ.S   .term
+
+        MOVE.L  #32,D6
+        CMP.L   D6,D7
+        BHI.S   .full
+        MOVE.L  D7,D6               ; D6 = data bytes this record
+.full
+        ; byte count = data + 5 (4 addr bytes + 1 checksum)
+        MOVE.L  D6,D5
+        ADDQ.L  #5,D5               ; D5 = byte count
+
+        MOVE.B  #'S',D0
+        BSR     PUTCHAR
+        MOVE.B  #'3',D0
+        BSR     PUTCHAR
+        MOVE.L  D5,D0
+        BSR     PRINT_HEX2
+        MOVE.L  D5,D4               ; D4 = checksum accumulator (byte count)
+
+        ; Address bytes MSB first.
+        ; NOTE: checksum ADD must come BEFORE PRINT_HEX2 because PRINT_HEX2
+        ; clobbers D0 (leaves ASCII value of low hex nibble on return).
+        ; byte 3: bits 31:24
+        MOVE.L  A2,D0
+        MOVE.L  D0,D3
+        SWAP    D3
+        LSR.L   #8,D3
+        MOVE.L  D3,D0
+        ADD.B   D0,D4               ; checksum before print
+        BSR     PRINT_HEX2
+        ; byte 2: bits 23:16
+        MOVE.L  A2,D0
+        SWAP    D0
+        ADD.B   D0,D4
+        BSR     PRINT_HEX2
+        ; byte 1: bits 15:8
+        MOVE.L  A2,D0
+        LSR.L   #8,D0
+        ADD.B   D0,D4
+        BSR     PRINT_HEX2
+        ; byte 0: bits 7:0
+        MOVE.L  A2,D0
+        ADD.B   D0,D4
+        BSR     PRINT_HEX2
+
+        ; data bytes
+        MOVE.L  D6,D5
+.dat    MOVE.B  (A2)+,D0
+        ADD.B   D0,D4
+        BSR     PRINT_HEX2
+        SUBQ.L  #1,D5
+        BNE.S   .dat
+
+        NOT.B   D4
+        MOVE.B  D4,D0
+        BSR     PRINT_HEX2
+        BSR     PRINT_CRLF
+        SUB.L   D6,D7
+        BRA.W   .row
+
+.term   LEA     STR_S7_TERM,A0
+        BSR     PRINTSTR
+        MOVE.B  (SP)+,CONFIG_BUF+NV_CONSOLE_OUT
+        RTS
+
+
+;******************************************************************************
+;  L -- load S-records (S1/S2/S3 data, S7/S8/S9 terminates)
+;  S0 header and unrecognised types are drained and skipped.
+;  S7 is the standard terminator for S3-series files (vasm -Fmots default).
+;******************************************************************************
+CMD_LOAD:
+        LEA     STR_SREC_PROMPT,A0
+        BSR     PRINTSTR
+        MOVEQ   #0,D7               ; D7 = first-record flag (0 = not yet seen)
+
+.rec
+        ; wait for 'S'
+.sync   BSR     GETCHAR
+        CMP.B   #'S',D0
+        BNE.S   .sync
+
+        BSR     GETCHAR             ; record type digit
+        CMP.B   #'7',D0             ; S7 -- end of S3-series (vasm default)
+        BEQ.W   .done
+        CMP.B   #'8',D0             ; S8 -- end of S2-series
+        BEQ.W   .done
+        CMP.B   #'9',D0             ; S9 -- end of S1-series
+        BEQ.W   .done
+        CMP.B   #'1',D0
+        BEQ.W   .is_s1
+        CMP.B   #'2',D0
+        BEQ.W   .is_s2
+        CMP.B   #'3',D0
+        BEQ.W   .is_s3
+        ; S0 header or unknown type -- drain line and continue
+        BSR     DRAIN_LINE
+        BRA.W   .rec
+
+        ; S1: 2-byte address, byte_count includes 2 addr + 1 cksum
+.is_s1  BSR     GET_HEX_BYTE
+        MOVE.B  D0,D6
+        MOVE.B  D6,D4
+        MOVEQ   #0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        SUBQ.B  #3,D6               ; data bytes = byte_count - 2 addr - 1 cksum
+        BRA.S   .data
+
+        ; S2: 3-byte address, byte_count includes 3 addr + 1 cksum
+.is_s2  BSR     GET_HEX_BYTE
+        MOVE.B  D0,D6
+        MOVE.B  D6,D4
+        MOVEQ   #0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        SUBQ.B  #4,D6               ; data bytes = byte_count - 3 addr - 1 cksum
+        BRA.S   .data
+
+        ; S3: 4-byte address, byte_count includes 4 addr + 1 cksum
+.is_s3  BSR     GET_HEX_BYTE
+        MOVE.B  D0,D6
+        MOVE.B  D6,D4
+        MOVEQ   #0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        LSL.L   #8,D3
+        OR.B    D0,D3
+        SUBQ.B  #5,D6               ; data bytes = byte_count - 4 addr - 1 cksum
+
+.data   MOVEA.L D3,A2
+        ; On first data record, save load address for bare G command
+        TST.L   D7
+        BNE.S   .nodfl
+        MOVE.L  D3,SAVE_PC
+        MOVEQ   #1,D7
+.nodfl  MOVE.B  D6,D5
+.dl     SUBQ.B  #1,D5
+        BMI.S   .ck
+        BSR     GET_HEX_BYTE
+        ADD.B   D0,D4
+        MOVE.B  D0,(A2)+
+        BRA.S   .dl
+.ck     BSR     GET_HEX_BYTE        ; checksum byte
+        ADD.B   D0,D4
+        CMP.B   #$FF,D4
+        BNE.S   .ckerr
+        MOVE.B  #'.',D0             ; '.' = record OK
+        BSR     PUTCHAR
+        BRA.W   .rec
+.ckerr  MOVE.B  #'!',D0             ; '!' = checksum error
+        BSR     PUTCHAR
+        BRA.W   .rec
+
+.done   BSR     DRAIN_LINE          ; consume rest of S7/S8/S9 line
+        LEA     STR_LOAD_OK,A0
+        BSR     PRINTSTR            ; "OK"
+        TST.L   D7
+        BEQ.S   .noaddr
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVE.L  SAVE_PC,D0
+        BSR     PRINT_HEX8          ; print start address of loaded program
+.noaddr BSR     PRINT_CRLF
+        BRA     CMD_LOOP
+
+
+; Read two ASCII hex digits from serial → D0.b, preserves D1
+GET_HEX_BYTE:
+        BSR     GETCHAR
+        BSR     NYBBLE
+        LSL.B   #4,D0
+        MOVE.B  D0,D1
+        BSR     GETCHAR
+        BSR     NYBBLE
+        OR.B    D1,D0
+        RTS
+
+; ASCII hex char D0 -> nybble value D0
+NYBBLE:
+        SUBI.B  #'0',D0
+        CMPI.B  #9,D0
+        BLE.S   .ok
+        SUBI.B  #7,D0
+        ANDI.B  #$0F,D0
+.ok     RTS
+
+
+; DRAIN_LINE -- read and discard serial chars until CR or LF
+DRAIN_LINE:
+.dl     BSR     GETCHAR
+        CMP.B   #$0D,D0
+        BEQ.S   .dld
+        CMP.B   #$0A,D0
+        BNE.S   .dl
+.dld    RTS
+
+
+;******************************************************************************
+;  X - save BASIC program as S-records
+;  Saves BASIC_RAM+$0100 (LAB_WARM + I/O vectors + pointers) through the end
+;  of the program text.  Loading these records and warm-starting restores the
+;  exact program that was running at the time of the save.
+;******************************************************************************
+CMD_XBASIC:
+        ; Check BASIC has been cold-started (warm-start JMP opcode present)
+        MOVE.W  BASIC_RAM+LAB_WARM,D0
+        CMP.W   #$4EF9,D0
+        BNE.S   .noinit
+
+        ; Find end of program by following long next-line pointers from Smeml
+        MOVEA.L BASIC_RAM+Smeml,A3  ; A3 = absolute start of program text
+.scan   MOVE.L  (A3),D0             ; read next-line pointer (long, $00000000 = EOT)
+        BEQ.S   .found
+        MOVEA.L D0,A3               ; follow pointer to next line
+        BRA.S   .scan
+.found  ADDQ.L  #4,A3               ; skip past the $00000000 terminator long
+
+        ; Emit S3 records from LAB_WARM through end of program
+        MOVEA.L #BASIC_RAM+LAB_WARM,A2
+        MOVE.L  A3,D7
+        SUB.L   A2,D7               ; D7 = byte count
+        BLE     CMD_LOOP
+        BSR     EMIT_SRECS
+        BRA     CMD_LOOP
+
+.noinit LEA     STR_BASIC_NOINIT,A0
+        BSR     PRINTSTR
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  B - launch EhBASIC
+;******************************************************************************
+CMD_BASIC:
+        ; Check if BASIC RAM has been initialised (cold start writes JMP opcode there)
+        MOVE.W  BASIC_RAM+LAB_WARM,D0
+        CMP.W   #$4EF9,D0
+        BNE.S   .cold               ; Not yet initialised -- must cold start
+        LEA     STR_COLDWARM,A0
+        BSR     PRINTSTR
+        BSR     GETCHAR
+        BSR     PRINT_CRLF
+        ANDI.B  #$DF,D0
+        CMP.B   #'W',D0
+        BNE.S   .cold
+        MOVEA.L #BASIC_RAM,A3       ; EhBASIC warm start needs A3 = RAM base
+        JMP     BASIC_RAM+LAB_WARM  ; warm start -- program intact
+.cold   JMP     BASIC_START         ; cold start
+
+
+;******************************************************************************
+;  EXCEPTION HANDLERS  - reset SP then restart monitor
+;******************************************************************************
+
+;******************************************************************************
+;  Unified exception handler - extracts PC and vector from the 68020
+;  exception frame before resetting SP.
+;
+;  68020 exception frame (all formats):
+;    SP+0:  saved SR        (word)
+;    SP+2:  saved PC        (longword)
+;    SP+6:  format/vector   (word: [15:12]=format, [11:0]=vector offset)
+;
+;  Bus Error (format $A/$B) and Address Error have larger frames, but
+;  SR/PC/Format are always at the same offsets from the top of the frame.
+;
+;  Output example:
+;    ** EXCEPTION at PC=$00005234  Vec=$064 (IPL-1 Autovector)  SR=$2000 **
+;******************************************************************************
+
+BUSERR_HANDLER:
+ADDRERR_HANDLER:
+ILLEGAL_HANDLER:
+GENERIC_HANDLER:
+        ; Extract exception info from the frame BEFORE resetting SP.
+        ; Use A1 as scratch - we're about to reset SP anyway.
+        MOVE.W  (SP),D3             ; D3 = saved SR
+        MOVE.L  2(SP),D4            ; D4 = saved PC (faulting instruction)
+        MOVE.W  6(SP),D5            ; D5 = format/vector word
+
+        ; Now safe to reset SP and reinit hardware
+        MOVEA.L #STACK_TOP,SP
+        ORI.W   #$0700,SR           ; mask all interrupts - prevent ISR during crash report
+        BSR     INIT_HW             ; SCC may not be initialised yet if fault fired early
+
+        ; Print to serial only (VERA may be in a bad state)
+        LEA     STR_EXC_HDR,A0
+        BSR     PRINTSTR_SERIAL
+
+        ; Print PC
+        MOVE.L  D4,D0
+        BSR     PRINT_HEX8_SERIAL
+
+        ; Print vector offset
+        LEA     STR_EXC_VEC,A0
+        BSR     PRINTSTR_SERIAL
+        MOVE.W  D5,D0
+        ANDI.W  #$0FFF,D0           ; isolate vector offset (lower 12 bits)
+        BSR     PRINT_HEX4_SERIAL
+
+        ; Print vector name if known
+        BSR     EXC_PRINT_NAME
+
+        ; Print SR
+        LEA     STR_EXC_SR,A0
+        BSR     PRINTSTR_SERIAL
+        MOVE.W  D3,D0
+        BSR     PRINT_HEX4_SERIAL
+
+        ; Print format nibble
+        LEA     STR_EXC_FMT,A0
+        BSR     PRINTSTR_SERIAL
+        MOVE.W  D5,D0
+        LSR.W   #8,D0
+        LSR.W   #4,D0               ; format nibble in low 4 bits
+        BSR     HEX_NYBBLE_SERIAL
+
+        LEA     STR_EXC_TAIL,A0
+        BSR     PRINTSTR_SERIAL
+        BSR     FLUSH_TX
+
+        ; Wait for keypress then reboot
+        BSR     FLUSH_TX
+        BSR     GETCHAR
+        ; Print newline and wait for SCC to finish transmitting
+        MOVE.B  #$0D,D0
+        BSR     PUTCHAR_SER_EXC
+        MOVE.B  #$0A,D0
+        BSR     PUTCHAR_SER_EXC
+        BSR     FLUSH_TX
+        BRA     START
+
+
+; --- Serial-only output routines for exception handler ---
+; These bypass VERA/PUTCHAR entirely to avoid re-entering buggy code.
+
+PRINTSTR_SERIAL:
+        MOVEM.L D0,-(SP)
+.ps     MOVE.B  (A0)+,D0
+        BEQ.S   .psd
+        BSR.S   PUTCHAR_SER_EXC
+        BRA.S   .ps
+.psd    MOVEM.L (SP)+,D0
+        RTS
+
+PUTCHAR_SER_EXC:
+.txw    BTST    #2,SCC_A_CTRL
+        BEQ.S   .txw
+        MOVE.B  D0,SCC_A_DATA
+        RTS
+
+PRINT_HEX8_SERIAL:
+        MOVEM.L D1-D2,-(SP)
+        MOVE.L  D0,D1
+        MOVEQ   #7,D2
+.h8s    ROL.L   #4,D1
+        MOVE.B  D1,D0
+        ANDI.B  #$0F,D0
+        BSR.S   HEX_NYBBLE_SERIAL
+        DBF     D2,.h8s
+        MOVEM.L (SP)+,D1-D2
+        RTS
+
+PRINT_HEX4_SERIAL:
+        MOVEM.L D1-D2,-(SP)
+        MOVE.W  D0,D1
+        MOVEQ   #3,D2
+.h4s    ROL.W   #4,D1
+        MOVE.B  D1,D0
+        ANDI.B  #$0F,D0
+        BSR.S   HEX_NYBBLE_SERIAL
+        DBF     D2,.h4s
+        MOVEM.L (SP)+,D1-D2
+        RTS
+
+HEX_NYBBLE_SERIAL:
+        ANDI.B  #$0F,D0
+        ADDI.B  #'0',D0
+        CMPI.B  #'9',D0
+        BLE.S   .hns_ok
+        ADDI.B  #7,D0
+.hns_ok BSR.S   PUTCHAR_SER_EXC
+        RTS
+
+
+; --- Vector name lookup ---
+EXC_PRINT_NAME:
+        MOVE.W  D5,D0
+        ANDI.W  #$0FFF,D0
+        CMP.W   #$008,D0
+        BEQ.S   .bus
+        CMP.W   #$00C,D0
+        BEQ.S   .addr
+        CMP.W   #$010,D0
+        BEQ.S   .ill
+        CMP.W   #$014,D0
+        BEQ.S   .zdiv
+        CMP.W   #$060,D0
+        BEQ.S   .spur
+        CMP.W   #$064,D0
+        BEQ.S   .ipl1
+        CMP.W   #$068,D0
+        BEQ.S   .ipl2
+        CMP.W   #$070,D0
+        BEQ.S   .ipl4
+        CMP.W   #$078,D0
+        BEQ.S   .ipl6
+        RTS                         ; unknown vector - skip name
+.bus    LEA     STR_VN_BUS,A0
+        BRA.S   .pn
+.addr   LEA     STR_VN_ADDR,A0
+        BRA.S   .pn
+.ill    LEA     STR_VN_ILL,A0
+        BRA.S   .pn
+.zdiv   LEA     STR_VN_ZDIV,A0
+        BRA.S   .pn
+.spur   LEA     STR_VN_SPUR,A0
+        BRA.S   .pn
+.ipl1   LEA     STR_VN_IPL1,A0
+        BRA.S   .pn
+.ipl2   LEA     STR_VN_IPL2,A0
+        BRA.S   .pn
+.ipl4   LEA     STR_VN_IPL4,A0
+        BRA.S   .pn
+.ipl6   LEA     STR_VN_IPL6,A0
+.pn     BSR     PRINTSTR_SERIAL
+        RTS
+
+
+; FLUSH_TX -- wait for Z85C30 TX shift register to finish transmitting
+; Polls RR0 bit 2 (TX buffer empty) then RR1 bit 0 (All Sent).
+; Prevents garbled last char when SCC is reset immediately after print.
+FLUSH_TX:
+.txe    BTST    #2,SCC_A_CTRL       ; RR0 bit 2 = TX buffer empty
+        BEQ.S   .txe
+        MOVE.B  #1,SCC_A_CTRL       ; select RR1
+.snt    BTST    #0,SCC_A_CTRL       ; RR1 bit 0 = All Sent (shift reg empty)
+        BEQ.S   .snt
+        MOVE.B  #0,SCC_A_CTRL       ; reset register select back to RR0
+        RTS
+
+
+;******************************************************************************
+;  Z85C30 HAL
+;******************************************************************************
+
+; INIT_HW - initialise Ch A for 9600 8N1
+INIT_HW:
+        TST.B   $07000020           ; PAL sync strobe -- required before every SCC init (matches original ROM at 0x994 and 0x848B6)
+        MOVE.B  #9,SCC_A_CTRL       ; select WR9
+        MOVE.B  #$C0,SCC_A_CTRL     ; hardware reset (both channels)
+        MOVE.L  #$2800,D0           ; delay for reset completion
+.dly    SUBQ.L  #1,D0
+        BNE.S   .dly
+        ; WR4: x16 clock, 1 stop bit, no parity
+        MOVE.B  #4,SCC_A_CTRL
+        MOVE.B  #$44,SCC_A_CTRL
+        ; WR11: BRG to Rx and Tx clocks
+        MOVE.B  #11,SCC_A_CTRL
+        MOVE.B  #$50,SCC_A_CTRL
+        ; WR12/13: time constant for 9600 baud (matches original ROM values)
+        MOVE.B  #12,SCC_A_CTRL
+        MOVE.B  #$0A,SCC_A_CTRL
+        MOVE.B  #13,SCC_A_CTRL
+        MOVE.B  #$00,SCC_A_CTRL
+        ; WR14: enable BRG, PCLK source
+        MOVE.B  #14,SCC_A_CTRL
+        MOVE.B  #$01,SCC_A_CTRL
+        ; WR3: 8 bits/char, Rx enable
+        MOVE.B  #3,SCC_A_CTRL
+        MOVE.B  #$C1,SCC_A_CTRL
+        ; WR5: 8 bits/char, Tx enable, /DTR asserted, RTS bit=0
+        ; /RTSA feeds U18 LS30 (8-input NAND, other inputs tied high = acts as inverter).
+        ; NAND output drives the RS-232 CTS pin via the line driver, so the polarity is
+        ; inverted: RTS bit=0 -> /RTSA HIGH -> NAND LOW -> positive RS-232 -> CTS asserted.
+        ; RTS bit=1 would deassert CTS and prevent the terminal from sending.
+        MOVE.B  #5,SCC_A_CTRL
+        MOVE.B  #$E8,SCC_A_CTRL     ; $E8=11101000: DTR+8bit+TxEnable, RTS=0 (CTS asserted)
+        ; WR1: no interrupts
+        MOVE.B  #1,SCC_A_CTRL
+        MOVE.B  #$00,SCC_A_CTRL
+        RTS
+
+
+; PUTCHAR - output D0.B to serial or VERA depending on NV_CONSOLE_OUT bit 0
+PUTCHAR:
+        MOVEM.L D1,-(SP)            ; save D1 - GETLINE/PRINT_HEX depend on it
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ.S   .pc_serial
+        MOVE.W  VT_MAGIC,D1
+        CMPI.W  #VT_MAGIC_VAL,D1
+        BNE.S   .pc_serial
+        ; VERA path: call VERA_PUTCHAR via JMP thunk (handles IPL blocking internally)
+        MOVEM.L (SP)+,D1
+        JSR     VT_VEC_PUTCHAR
+        ; Tell the ISR to redraw the cursor at the new position on the
+        ; next VSYNC frame.  Only touches RAM - no VERA registers, no
+        ; register clobber.  The ISR checks VT_CURSOR_DIRTY and if set,
+        ; forces cursor on and resets the blink timer.
+        ; (Full CURSOR_ON call was removed: it caused BASIC screen corruption
+        ; due to VERA ADDR0 contention with the VSYNC ISR between characters.)
+        MOVE.B  #$FF,VT_CURSOR_DIRTY
+        RTS
+.pc_serial:
+        MOVEM.L (SP)+,D1
+PUTCHAR_SERIAL:
+        BTST    #2,SCC_A_CTRL
+        BEQ.S   PUTCHAR_SERIAL
+        MOVE.B  D0,SCC_A_DATA
+        RTS
+
+
+; GETCHAR - input D0.B (blocking); PS/2 redirect reserved for future use
+GETCHAR:
+        BTST    #0,SCC_A_CTRL       ; RR0 bit 0 = Rx char available?
+        BEQ.S   GETCHAR
+        MOVE.B  SCC_A_DATA,D0
+        RTS
+
+
+; PRINTSTR - print NUL-terminated string at A0 to serial or VERA
+PRINTSTR:
+        MOVEM.L D0,-(SP)
+        BTST    #0,CONFIG_BUF+NV_CONSOLE_OUT
+        BEQ.S   .pss_serial
+        MOVE.W  VT_MAGIC,D0
+        CMPI.W  #VT_MAGIC_VAL,D0
+        BNE.S   .pss_serial         ; fall back to serial if not initialized
+        MOVEM.L (SP)+,D0
+        JSR     VT_VEC_PRINTSTR     ; JMP thunk -> VERA_PRINTSTR in RAM
+        RTS
+.pss_serial:
+        MOVE.B  (A0)+,D0
+        BEQ.S   .pss_done
+.pss_tx:
+        BTST    #2,SCC_A_CTRL
+        BEQ.S   .pss_tx             ; wait for Tx buffer empty
+        MOVE.B  D0,SCC_A_DATA
+        BRA.S   .pss_serial
+.pss_done:
+        MOVEM.L (SP)+,D0
+        RTS
+
+
+; PRINT_CRLF
+PRINT_CRLF:
+        MOVEM.L D0,-(SP)
+        MOVE.B  #$0D,D0
+        BSR     PUTCHAR
+        MOVE.B  #$0A,D0
+        BSR     PUTCHAR
+        MOVEM.L (SP)+,D0
+        RTS
+
+
+; GETLINE - read line from serial into buffer at A0
+; Handles BS ($08) / DEL ($7F) with destructive backspace.
+; Returns A0 unchanged (pointing to buffer base).
+GETLINE:
+        MOVEM.L D0-D1/A1,-(SP)
+        MOVEA.L A0,A1               ; A1 = write pointer
+        MOVEQ   #LINE_BUF_SZ-1,D1  ; D1 = space remaining
+.gl     BSR     GETCHAR
+        CMP.B   #$0D,D0
+        BEQ.S   .gldone
+        CMP.B   #$0A,D0
+        BEQ.S   .gldone
+        CMP.B   #$08,D0
+        BEQ.S   .glbs
+        CMP.B   #$7F,D0
+        BEQ.S   .glbs
+        TST.L   D1
+        BEQ.S   .gl
+        MOVE.B  D0,(A1)+
+        BSR     PUTCHAR
+        SUBQ.L  #1,D1
+        BRA.S   .gl
+.glbs   CMP.L   #LINE_BUF_SZ-1,D1
+        BEQ.S   .gl
+        SUBQ.L  #1,A1
+        ADDQ.L  #1,D1
+        MOVE.B  #$08,D0
+        BSR     PUTCHAR
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVE.B  #$08,D0
+        BSR     PUTCHAR
+        BRA.S   .gl
+.gldone CLR.B   (A1)
+        BSR     PRINT_CRLF
+        MOVEM.L (SP)+,D0-D1/A1
+        RTS
+
+
+;******************************************************************************
+;  Hex output utilities
+;******************************************************************************
+
+; PRINT_HEX8 - print D0.l as 8 hex digits
+PRINT_HEX8:
+        MOVEM.L D1-D2,-(SP)
+        MOVE.L  D0,D1
+        MOVEQ   #7,D2
+.h8     ROL.L   #4,D1
+        MOVE.B  D1,D0
+        ANDI.B  #$0F,D0
+        BSR     HEX_NYBBLE
+        DBF     D2,.h8
+        MOVEM.L (SP)+,D1-D2
+        RTS
+
+; PRINT_HEX4 - print D0.w as 4 hex digits
+PRINT_HEX4:
+        MOVEM.L D1-D2,-(SP)
+        MOVE.W  D0,D1
+        MOVEQ   #3,D2
+.h4     ROL.W   #4,D1
+        MOVE.B  D1,D0
+        ANDI.B  #$0F,D0
+        BSR     HEX_NYBBLE
+        DBF     D2,.h4
+        MOVEM.L (SP)+,D1-D2
+        RTS
+
+; PRINT_HEX2 - print D0.b as 2 hex digits
+PRINT_HEX2:
+        MOVEM.L D1,-(SP)
+        MOVE.B  D0,D1
+        LSR.B   #4,D0
+        BSR     HEX_NYBBLE
+        MOVE.B  D1,D0
+        ANDI.B  #$0F,D0
+        BSR     HEX_NYBBLE
+        MOVEM.L (SP)+,D1
+        RTS
+
+; HEX_NYBBLE - output low nybble of D0 as ASCII
+HEX_NYBBLE:
+        ANDI.B  #$0F,D0
+        ADDI.B  #'0',D0
+        CMPI.B  #'9',D0
+        BLE.S   .ok
+        ADDI.B  #7,D0
+.ok     BSR     PUTCHAR
+        RTS
+
+
+;******************************************************************************
+;  Parse utilities  (A1 = parse cursor, updated in place)
+;******************************************************************************
+
+SKIP_SPACES_A1:
+        CMP.B   #' ',(A1)
+        BNE.S   .ss
+        ADDQ.L  #1,A1
+        BRA.S   SKIP_SPACES_A1
+.ss     RTS
+
+PARSE_HEX_A1:
+        MOVEM.L D1,-(SP)
+        MOVEQ   #0,D0
+.ph     MOVE.B  (A1),D1
+        CMP.B   #'a',D1
+        BLT.S   .phnc
+        CMP.B   #'f',D1
+        BGT.S   .phnc
+        SUBI.B  #$20,D1             ; fold lower to upper
+.phnc   CMP.B   #'0',D1
+        BLT.S   .phd
+        CMP.B   #'9',D1
+        BLE.S   .phdig
+        CMP.B   #'A',D1
+        BLT.S   .phd
+        CMP.B   #'F',D1
+        BGT.S   .phd
+        SUBI.B  #7,D1               ; 'A'-'0'-7 = value 10
+.phdig  SUBI.B  #'0',D1
+        LSL.L   #4,D0
+        OR.B    D1,D0
+        ADDQ.L  #1,A1
+        BRA.S   .ph
+.phd    MOVEM.L (SP)+,D1
+        RTS
+
+
+;******************************************************************************
+;  CMD_VERA_CFG - V: NVRAM configuration editor
+;******************************************************************************
+CMD_VERA_CFG:
+        BSR     NVRAM_CONFIG
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  CMD_TEST - T: continuous burn-in (code lives in extended section at $5000)
+;******************************************************************************
+CMD_TEST:
+        BSR     BURNIN_TEST
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  CMD_CPM - C: boot CP/M at $20000 (Bank 1)
+;******************************************************************************
+CMD_CPM:
+        MOVEA.L #$00020000,A0
+        MOVEM.L SAVE_D0,D0-D7
+        MOVEM.L SAVE_A0+4,A1-A6
+        JSR     (A0)
+        MOVEM.L D0-D7,SAVE_D0
+        MOVEM.L A0-A6,SAVE_A0
+        MOVEA.L #STACK_TOP,SP
+        LEA     STR_RETURNED,A0
+        BSR     PRINTSTR
+        BRA     CMD_REGS_SHOW
+
+
+;******************************************************************************
+;  CMD_UNIX - U: boot Unix at $40000 (Bank 2)
+;******************************************************************************
+CMD_UNIX:
+        MOVEA.L #$00040000,A0
+        MOVEM.L SAVE_D0,D0-D7
+        MOVEM.L SAVE_A0+4,A1-A6
+        JSR     (A0)
+        MOVEM.L D0-D7,SAVE_D0
+        MOVEM.L A0-A6,SAVE_A0
+        MOVEA.L #STACK_TOP,SP
+        LEA     STR_RETURNED,A0
+        BSR     PRINTSTR
+        BRA     CMD_REGS_SHOW
+
+
+;******************************************************************************
+;  CMD_SCSI - S: scan SCSI bus (code lives in extended section at $5000)
+;******************************************************************************
+CMD_SCSI:
+        ORI.W   #$0700,SR              ; mask all interrupts during SCSI scan
+        BSR     NS_SCSI_SCAN
+        ANDI.W  #$F8FF,SR              ; restore interrupts
+        BRA     CMD_LOOP
+
+
+;******************************************************************************
+;  RAM_TEST_BOOT - quick AA/55 RAM test
+;
+;  Writes $AAAAAAAA then $55555555 across RAM_TEST_START..RAM_TEST_END-4,
+;  verifying read-back after each full write pass.
+;
+;  On error prints: address, expected, actual, XOR diff, bank# (0-3),
+;  and the name of each failing D-line (D0..D31).
+;  Suppresses further errors once RAM_MAX_ERRS per pattern is reached.
+;
+;  Called from START at boot and from CMD_TEST on demand.
+;  Preserves all registers via MOVEM save/restore.
+;******************************************************************************
+RAM_TEST_BOOT:
+        MOVEM.L D0-D7/A0-A3,-(SP)
+        CLR.L   D7                       ; D7 = total error count across both patterns
+
+        LEA     STR_RT_HDR,A0
+        BSR     PRINTSTR
+
+        MOVE.L  #$AAAAAAAA,D5
+        BSR     RT_PASS
+        MOVE.L  #$55555555,D5
+        BSR     RT_PASS
+
+        TST.L   D7
+        BNE.S   .fail
+        LEA     STR_RT_OK,A0
+        BSR     PRINTSTR
+        BRA.S   .rtdone
+.fail   LEA     STR_RT_WARN,A0
+        BSR     PRINTSTR
+.rtdone MOVEM.L (SP)+,D0-D7/A0-A3
+        RTS
+
+
+;------------------------------------------------------------------------------
+; RT_PASS - one write-then-verify pass with the pattern in D5
+; D5 = pattern (preserved)
+; D7 = running total error count (updated, not saved here)
+; Trashes D0-D4/D6/A0-A3
+;------------------------------------------------------------------------------
+RT_PASS:
+        MOVEQ   #0,D6                    ; D6 = per-pattern error count
+
+        ; --- write pass ---
+        MOVEA.L #RAM_TEST_START,A0
+        MOVEA.L #RAM_TEST_END,A1
+.wrt    MOVE.L  D5,(A0)+
+        CMPA.L  A1,A0
+        BLT.S   .wrt
+
+        ; --- verify pass (one dot per 512KB block) ---
+        MOVEA.L #RAM_TEST_START,A0
+        MOVEA.L #RAM_TEST_START+$80000,A3
+.vfy    CMPA.L  A3,A0
+        BLT.S   .vchk
+        ADDA.L  #$80000,A3
+        MOVE.B  #'.',D0
+        BSR     PUTCHAR
+.vchk   MOVE.L  (A0)+,D4
+        CMP.L   D5,D4
+        BEQ.S   .ok
+        MOVEA.L A0,A2
+        SUBA.L  #4,A2                    ; A2 = address of failing longword
+        BSR     RT_ERR
+        ADDQ.L  #1,D6
+        ADDQ.L  #1,D7
+        CMP.L   #RAM_MAX_ERRS,D6
+        BGE.S   .cap
+.ok     CMPA.L  A1,A0
+        BLT.S   .vfy
+        RTS
+.cap    LEA     STR_RT_CAP,A0
+        BSR     PRINTSTR
+        RTS
+
+
+;------------------------------------------------------------------------------
+; RT_ERR - print one error line
+; A2 = failing address  D5 = expected value  D4 = actual value read
+; Preserves D4/D5/D6/D7/A0/A1/A2 (the caller's working state)
+;------------------------------------------------------------------------------
+RT_ERR:
+        MOVEM.L D0-D3/A0,-(SP)
+        BSR     PRINT_CRLF
+
+        ; address
+        LEA     STR_RT_FAILAT,A0
+        BSR     PRINTSTR
+        MOVE.L  A2,D0
+        BSR     PRINT_HEX8
+
+        ; expected (written)
+        LEA     STR_RT_WR,A0
+        BSR     PRINTSTR
+        MOVE.L  D5,D0
+        BSR     PRINT_HEX8
+
+        ; actual (read back)
+        LEA     STR_RT_RD,A0
+        BSR     PRINTSTR
+        MOVE.L  D4,D0
+        BSR     PRINT_HEX8
+
+        ; diff = bits that are wrong
+        MOVE.L  D5,D3
+        EOR.L   D4,D3
+        LEA     STR_RT_DIFF,A0
+        BSR     PRINTSTR
+        MOVE.L  D3,D0
+        BSR     PRINT_HEX8
+
+        ; bank number: (addr - $02000000) >> 20, low 2 bits
+        MOVE.L  A2,D0
+        SUBI.L  #$02000000,D0
+        LSR.L   #8,D0
+        LSR.L   #8,D0                    ; >> 16
+        LSR.L   #4,D0                    ; >> 20
+        ANDI.B  #$03,D0
+        MOVE.B  D0,D2                    ; save bank digit
+        LEA     STR_RT_BNK,A0
+        BSR     PRINTSTR
+        MOVE.B  D2,D0
+        ADD.B   #'0',D0
+        BSR     PUTCHAR
+
+        ; failing D-lines: scan bits 0..31 of diff, print "D<n>" for each set bit
+        MOVE.L  D3,D2                    ; D2 = diff (D3 preserved for nothing, but keep clean)
+        MOVEQ   #0,D1                    ; D1 = bit index 0..31
+.rtbl   BTST    D1,D2
+        BEQ.S   .rtnb                    ; bit clear - not this D-line
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        MOVE.B  #'D',D0
+        BSR     PUTCHAR
+        MOVE.L  D1,D0
+        BSR     RT_PRINT_DEC2
+.rtnb   ADDQ.L  #1,D1
+        CMP.L   #32,D1
+        BLT.S   .rtbl
+
+        MOVEM.L (SP)+,D0-D3/A0
+        RTS
+
+
+;------------------------------------------------------------------------------
+; RT_PRINT_DEC2 - print D0.l (range 0-31) as 1 or 2 decimal digits
+;------------------------------------------------------------------------------
+RT_PRINT_DEC2:
+        MOVEM.L D0-D1,-(SP)
+        DIVU    #10,D0                   ; D0.w = quotient, D0 hi word = remainder
+        TST.W   D0                       ; quotient zero? (value was 0-9)
+        BEQ.S   .rt2ones
+        MOVE.W  D0,D1                    ; tens digit
+        ADD.B   #'0',D1
+        MOVE.B  D1,D0
+        BSR     PUTCHAR
+.rt2ones
+        SWAP    D0                       ; remainder to low word
+        ADD.B   #'0',D0
+        BSR     PUTCHAR
+        MOVEM.L (SP)+,D0-D1
+        RTS
+
+
+;******************************************************************************
+;  String constants
+;******************************************************************************
+
+STR_BANNER:
+        DC.B    $0D,$0A
+        DC.B    "Agfa Compugraphic 9000PS",$0D,$0A
+        DC.B    "by Adrian Black / Adrian's Digital Basement 2026",$0D,$0A
+        DC.B    $0D,$0A
+        DC.B    0
+
+        INCLUDE "include/build_version.inc"
+
+STR_PROMPT:
+        DC.B    $0D,$0A,"AGFA-MON> ",0
+
+STR_HELP:
+        DC.B    "Commands:",$0D,$0A
+        DC.B    "  B                       : Launch BASIC (CALL 1054 to exit)",$0D,$0A
+        DC.B    "  C                       : Boot CP/M",$0D,$0A
+        DC.B    "  D [addr] [len]          : Hex/ASCII dump",$0D,$0A
+        DC.B    "  E <addr>                : Examine/edit memory (. to quit)",$0D,$0A
+        DC.B    "  F <addr> <len> <byte>   : Fill memory",$0D,$0A
+        DC.B    "  G [addr]                : Execute",$0D,$0A
+        DC.B    "  H or ?                  : Show this help",$0D,$0A
+        DC.B    "  L                       : Load S-records from terminal",$0D,$0A
+        DC.B    "  M <src> <dst> <len>     : Copy memory",$0D,$0A
+        DC.B    "  P <addr> <len>          : Send S-records to terminal",$0D,$0A
+        DC.B    "  R                       : Show CPU registers",$0D,$0A
+        DC.B    "  S                       : Scan SCSI bus",$0D,$0A
+        DC.B    "  T                       : RAM burn-in test",$0D,$0A
+        DC.B    "  U                       : Boot UNIX",$0D,$0A
+        DC.B    "  V                       : Edit System NVRAM",$0D,$0A
+        DC.B    "  X                       : Save BASIC program as S-records",$0D,$0A
+        DC.B    "All numbers in hex",$0D,$0A
+        DC.B    0
+
+STR_WHAT:
+        DC.B    "?",$0D,$0A,0
+
+STR_COLON_SP:
+        DC.B    ": ",0
+
+STR_3SP:
+        DC.B    "   ",0
+
+STR_RETURNED:
+        DC.B    $0D,$0A,"RETURNED",$0D,$0A,0
+
+STR_D_LABEL:
+        DC.B    "D: ",0
+
+STR_A_LABEL:
+        DC.B    "A: ",0
+
+STR_PC_SR:
+        DC.B    "PC SR: ",0
+
+STR_CTRL:
+        DC.B    "VBR CACR ISP MSP: ",0
+
+STR_S7_TERM:
+        DC.B    "S70500000000FA",$0D,$0A,0
+
+STR_SREC_PROMPT:
+        DC.B    "Send S-records (S7/S8/S9 to end)...",$0D,$0A,0
+
+STR_COLDWARM:
+        DC.B    "Cold/Warm? ",0
+
+STR_LOAD_OK:
+        DC.B    "OK",0
+
+STR_BASIC_NOINIT:
+        DC.B    "BASIC not initialised",$0D,$0A,0
+
+STR_RT_HDR:
+        DC.B    "System starting: RAM test $02008000-$023EFFFF",0
+STR_RT_OK:
+        DC.B    " RAM OK",$0D,$0A,0
+STR_RT_WARN:
+        DC.B    $0D,$0A,"*** RAM ERRORS DETECTED ***",$0D,$0A,0
+STR_RT_CAP:
+        DC.B    $0D,$0A,"  (further errors suppressed)",0
+STR_RT_FAILAT:
+        DC.B    "  FAIL @ $",0
+STR_RT_WR:
+        DC.B    "  wr $",0
+STR_RT_RD:
+        DC.B    "  rd $",0
+STR_RT_DIFF:
+        DC.B    "  diff $",0
+STR_RT_BNK:
+        DC.B    "  Bnk",0
+
+; Exception handler strings (serial-only output)
+STR_EXC_HDR:
+        DC.B    $0D,$0A,"** EXCEPTION at PC=$",0
+STR_EXC_VEC:
+        DC.B    "  Vec=$",0
+STR_EXC_SR:
+        DC.B    "  SR=$",0
+STR_EXC_FMT:
+        DC.B    "  Fmt=",0
+STR_EXC_TAIL:
+        DC.B    " **",$0D,$0A
+        DC.B    "Press any key to reboot...",0
+
+; Vector name strings
+STR_VN_BUS:
+        DC.B    " (Bus Error)",0
+STR_VN_ADDR:
+        DC.B    " (Address Error)",0
+STR_VN_ILL:
+        DC.B    " (Illegal Instruction)",0
+STR_VN_ZDIV:
+        DC.B    " (Zero Divide)",0
+STR_VN_SPUR:
+        DC.B    " (Spurious IRQ)",0
+STR_VN_IPL1:
+        DC.B    " (IPL-1 Autovector)",0
+STR_VN_IPL2:
+        DC.B    " (IPL-2 Autovector)",0
+STR_VN_IPL4:
+        DC.B    " (IPL-4 Autovector)",0
+STR_VN_IPL6:
+        DC.B    " (IPL-6 Autovector)",0
+
+
+;******************************************************************************
+;  EXTENDED COMMANDS  - must appear BEFORE the EhBASIC include because
+;  ehbasic68k.inc ends with an END directive that stops all assembly.
+;  Binary output places each ORG section at the correct ROM offset regardless
+;  of source order.  EhBASIC occupies $1500-$49F1; this section starts at $5000.
+;******************************************************************************
+
+        ORG     $005000
+
+;==============================================================================
+;  BURNIN_TEST -- continuous RAM burn-in, any key to stop
+;
+;  5 patterns: AA 55 00 FF address-as-data. Loops until keypress.
+;  Output: Pass NNNNN: AA....... 55....... 00....... FF....... AD....... ok
+;  One dot per 512KB verified. Errors printed inline (capped at 4 per pattern).
+;
+;  D4 = per-pattern error count
+;  D5 = current pattern ($DEADBEEF = address-as-data sentinel)
+;  D6 = pass counter
+;  D7 = total error count
+;  A3 = pattern table pointer
+;  A4 = next dot-threshold address
+;==============================================================================
+BURNIN_TEST:
+        MOVEM.L D0-D7/A0-A6,-(SP)
+
+        LEA     STR_BI_HDR,A0
+        BSR     PRINTSTR
+
+        CLR.L   D7                       ; total error count
+        MOVEQ   #0,D6                    ; pass counter
+
+;---------- outer pass loop ---------------------------------------------------
+BI_PASS_LOOP:
+        ADDQ.L  #1,D6
+        MOVE.L  D7,-(SP)                 ; snapshot D7 for per-pass ok/err display
+
+        LEA     STR_BI_PASS,A0
+        BSR     PRINTSTR
+        MOVE.L  D6,D0
+        BSR     BI_PRINT_DEC
+        LEA     STR_BI_COLON,A0
+        BSR     PRINTSTR
+
+        LEA     BI_PATTERNS,A3
+
+;---------- inner pattern loop ------------------------------------------------
+BI_PAT_LOOP:
+        MOVE.L  (A3)+,D5                 ; load next pattern
+        CMPI.L  #$7FFFFFFF,D5            ; end-of-table?
+        BEQ.W   BI_PASS_DONE
+
+        CLR.L   D4                       ; per-pattern error count
+
+        ; print 2-char pattern label: high byte as hex, or "AD" for addr-as-data
+        MOVE.B  #' ',D0
+        BSR     PUTCHAR
+        CMPI.L  #$DEADBEEF,D5
+        BNE.S   .bi_hexlbl
+        MOVE.B  #'A',D0
+        BSR     PUTCHAR
+        MOVE.B  #'D',D0
+        BSR     PUTCHAR
+        BRA.S   .bi_write
+.bi_hexlbl:
+        MOVE.L  D5,D0
+        SWAP    D0                       ; high word -> low word
+        LSR.W   #8,D0                    ; high byte of pattern -> D0.B
+        BSR     PRINT_HEX2
+
+        ;--- write phase (no per-word keycheck) ---
+.bi_write:
+        MOVEA.L #RAM_TEST_START,A0
+        MOVEA.L #RAM_TEST_END,A1
+BI_WR:
+        CMPI.L  #$DEADBEEF,D5
+        BNE.S   .wconst
+        MOVE.L  A0,(A0)+
+        BRA.S   .wchk
+.wconst:
+        MOVE.L  D5,(A0)+
+.wchk:
+        CMPA.L  A1,A0
+        BLT.S   BI_WR
+
+        ;--- verify phase (dot + keycheck every 512KB) ---
+        MOVEA.L #RAM_TEST_START,A0
+        MOVEA.L #RAM_TEST_START+$80000,A4
+BI_VFY:
+        CMPA.L  A4,A0
+        BLT.S   .vfetch
+        ADDA.L  #$80000,A4               ; advance dot threshold
+        MOVE.B  #'.',D0
+        BSR     PUTCHAR
+        BTST    #0,SCC_A_CTRL            ; Rx char ready?
+        BEQ.S   .vfetch
+        MOVE.B  SCC_A_DATA,D0            ; drain char
+        MOVE.L  (SP)+,D0                 ; discard pass snapshot
+        BRA     BI_STOPPED
+.vfetch:
+        MOVE.L  (A0)+,D3                 ; read value
+        CMPI.L  #$DEADBEEF,D5
+        BNE.S   .vconst
+        MOVE.L  A0,D2
+        SUBQ.L  #4,D2                    ; expected = this longword's address
+        BRA.S   .vcmp
+.vconst:
+        MOVE.L  D5,D2                    ; expected = pattern
+.vcmp:
+        CMP.L   D3,D2
+        BEQ.S   .vnext
+        CMPI.L  #4,D4                    ; error cap: max 4 per pattern
+        BGE.S   .vnext
+        MOVEM.L D4/D5/A0/A1/A3,-(SP)    ; preserve loop state
+        MOVEA.L A0,A2
+        SUBA.L  #4,A2                    ; A2 = failing address
+        MOVE.L  D3,D4                    ; D4 = actual (RT_ERR convention)
+        MOVE.L  D2,D5                    ; D5 = expected (RT_ERR convention)
+        BSR     RT_ERR
+        MOVEM.L (SP)+,D4/D5/A0/A1/A3    ; restore loop state
+        ADDQ.L  #1,D4                    ; per-pattern error count
+        ADDQ.L  #1,D7                    ; total error count
+.vnext:
+        CMPA.L  A1,A0
+        BLT.W   BI_VFY
+        BRA     BI_PAT_LOOP
+
+;---------- end-of-pass -------------------------------------------------------
+BI_PASS_DONE:
+        MOVE.L  (SP)+,D0                 ; pop pass snapshot
+        CMP.L   D7,D0                    ; any new errors this pass?
+        BEQ.S   .biok
+        LEA     STR_BI_ERR,A0
+        BSR     PRINTSTR
+        BRA.S   .biscan
+.biok:
+        LEA     STR_BI_OK,A0
+        BSR     PRINTSTR
+.biscan:
+        BRA     BI_PASS_LOOP
+
+;---------- stopped by keypress -----------------------------------------------
+BI_STOPPED:
+        BSR     PRINT_CRLF
+        LEA     STR_BI_STOP,A0
+        BSR     PRINTSTR
+        MOVE.L  D6,D0
+        BSR     BI_PRINT_DEC
+        LEA     STR_BI_STOP2,A0
+        BSR     PRINTSTR
+        MOVE.L  D7,D0
+        BSR     BI_PRINT_DEC
+        LEA     STR_BI_STOP3,A0
+        BSR     PRINTSTR
+
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        RTS
+
+
+;------------------------------------------------------------------------------
+; BI_PRINT_DEC -- print D0.l as unsigned decimal (no leading zeros, up to 10 digits)
+;------------------------------------------------------------------------------
+BI_PRINT_DEC:
+        MOVEM.L D0-D3/A1,-(SP)
+        SUBA.W  #12,SP                   ; 12-byte digit buffer (max 10 digits)
+        LEA     12(SP),A1                ; point to TOP of buffer; -(A1) stores within it
+        MOVEQ   #0,D2                    ; digit count
+        MOVEQ   #0,D3
+.bpd_lp:
+        DIVU.L  #10,D3:D0                ; D0=quotient D3=remainder
+        ADDI.B  #'0',D3
+        MOVE.B  D3,-(A1)                 ; push digit
+        ADDQ.L  #1,D2
+        MOVEQ   #0,D3
+        TST.L   D0
+        BNE.S   .bpd_lp
+.bpd_print:
+        MOVE.B  (A1)+,D0
+        BSR     PUTCHAR
+        SUBQ.L  #1,D2
+        BNE.S   .bpd_print
+        ADDA.W  #12,SP
+        MOVEM.L (SP)+,D0-D3/A1
+        RTS
+
+
+;----------------------------------------------------------------------
+; Burn-in data
+;----------------------------------------------------------------------
+        EVEN
+BI_PATTERNS:
+        DC.L    $FFFFFFFF
+        DC.L    $AAAAAAAA
+        DC.L    $55555555
+        DC.L    $00000000               ; last pass leaves RAM blank
+        DC.L    $7FFFFFFF               ; end-of-table marker
+
+STR_BI_HDR:
+        DC.B    $0D,$0A,"RAM burn-in $02008000-$023EFFFF. Any key to stop.",$0D,$0A,0
+STR_BI_PASS:
+        DC.B    $0D,$0A,"Pass ",0
+STR_BI_COLON:
+        DC.B    ": ",0
+STR_BI_OK:
+        DC.B    " ok",0
+STR_BI_ERR:
+        DC.B    " err",0
+STR_BI_STOP:
+        DC.B    $0D,$0A,"Stopped after ",0
+STR_BI_STOP2:
+        DC.B    " passes, ",0
+STR_BI_STOP3:
+        DC.B    " total errors.",$0D,$0A,0
+
+
+;==============================================================================
+;  NS_SCSI_SCAN - scan SCSI IDs 0-6, print vendor/model/capacity/geometry
+;  Adapted from scsi.m68 v1.1. All registers preserved.
+;==============================================================================
+NS_SCSI_SCAN:
+        MOVEM.L D0-D7/A0-A6,-(SP)
+
+        BSR     NS_RESET_BUS
+
+        MOVEQ   #0,D7                    ; D7 = target ID (0-6)
+
+NS_SCAN_LOOP:
+        LEA     NS_STR_ID,A0
+        BSR     PRINTSTR
+        MOVE.B  D7,D0
+        ADD.B   #'0',D0
+        BSR     PUTCHAR
+
+        ; --- INQUIRY ---
+        BSR     NS_SELECT_TARGET
+        TST.L   D0
+        BNE.W   .next
+
+        LEA     NS_STR_FOUND,A0
+        BSR     PRINTSTR
+
+        LEA     NS_CDB_INQ,A5
+        LEA     NS_DATA_BUF,A4
+        BSR     NS_RUN_SM
+        TST.B   D5
+        BNE.W   .fail
+        BSR     NS_PRINT_DRIVE_INFO
+
+        ; --- READ CAPACITY ---
+        BSR     NS_SELECT_TARGET
+        TST.L   D0
+        BNE.W   .next
+        LEA     NS_CDB_CAP,A5
+        LEA     NS_DATA_BUF,A4
+        BSR     NS_RUN_SM
+        TST.B   D5
+        BNE.S   .no_cap
+        BSR     NS_CALC_CAPACITY
+.no_cap
+
+        ; --- MODE SENSE geometry ---
+        BSR     NS_SELECT_TARGET
+        TST.L   D0
+        BNE.W   .next
+        LEA     NS_CDB_GEOM,A5
+        LEA     NS_DATA_BUF,A4
+        BSR     NS_RUN_SM
+        TST.B   D5
+        BNE.S   .no_geom
+        BSR     NS_PRINT_GEOMETRY
+.no_geom
+        BRA.W   .next
+
+.fail
+        LEA     NS_STR_CHECK,A0
+        BSR     PRINTSTR
+.next
+        BSR     NS_RELEASE_BUS
+        ADDQ.L  #1,D7
+        CMP.L   #7,D7
+        BNE.W   NS_SCAN_LOOP
+
+        LEA     NS_STR_DONE,A0
+        BSR     PRINTSTR
+
+        MOVEM.L (SP)+,D0-D7/A0-A6
+        RTS
+
+
+;--- NS_RUN_SM - SCSI state machine (command + data + status + msg phases) ---
+; A5 = CDB pointer   A4 = data buffer
+; Returns: D5.b = SCSI status byte (0 = GOOD)
+NS_RUN_SM:
+        MOVEQ   #0,D6                    ; byte counter
+        MOVEQ   #-1,D5                   ; default status = error ($FF)
+
+.sm_loop
+        MOVE.L  #2000000,D0
+.wreq
+        MOVE.B  SCSI_STATUS,D2
+        BTST    #STAT_REQ,D2
+        BNE.S   .got_req
+        BTST    #STAT_BSY,D2
+        BEQ.W   .disconnected
+        SUBQ.L  #1,D0
+        BNE.S   .wreq
+        RTS
+
+.got_req
+        MOVE.B  SCSI_STATUS,D3
+        ANDI.B  #$1C,D3
+
+        MOVE.B  D3,D1
+        LSR.B   #2,D1
+        MOVE.B  D1,SCSI_TCR
+
+        CMP.B   #$08,D3
+        BEQ.S   .skip_drop
+        MOVE.B  #0,SCSI_ICR
+.skip_drop
+
+        CMP.B   #$08,D3
+        BEQ.W   .do_cmd
+        CMP.B   #$04,D3
+        BEQ.W   .do_datain
+        CMP.B   #$0C,D3
+        BEQ.W   .do_status
+        CMP.B   #$1C,D3
+        BEQ.W   .do_msg
+        BRA.W   .do_unknown
+
+.do_cmd
+        MOVE.B  (A5)+,D4
+        MOVE.B  D4,SCSI_ODR
+        MOVE.B  #$01,SCSI_ICR
+        NOP
+        NOP
+        MOVE.B  #$11,SCSI_ICR
+        BRA.S   .ack_wait
+
+.do_datain
+        MOVE.B  SCSI_ODR,D4
+        MOVE.B  D4,(A4)+
+        MOVE.B  #$10,SCSI_ICR
+        BRA.S   .ack_wait
+
+.do_status
+        MOVE.B  SCSI_ODR,D4
+        MOVE.B  D4,D5
+        MOVE.B  #$10,SCSI_ICR
+        BRA.S   .ack_wait
+
+.do_msg
+        MOVE.B  SCSI_ODR,D4
+        MOVE.B  #$10,SCSI_ICR
+        BRA.S   .ack_wait
+
+.do_unknown
+        MOVE.B  #$10,SCSI_ICR
+
+.ack_wait
+        MOVE.L  #2000000,D0
+.wdrop
+        MOVE.B  SCSI_STATUS,D2
+        BTST    #STAT_REQ,D2
+        BEQ.S   .req_dropped
+        SUBQ.L  #1,D0
+        BNE.S   .wdrop
+        RTS
+
+.req_dropped
+        CMP.B   #$08,D3
+        BEQ.S   .hold_dbus
+        MOVE.B  #0,SCSI_ICR
+        BRA.S   .drop_done
+.hold_dbus
+        MOVE.B  #$01,SCSI_ICR
+.drop_done
+        ADDQ.L  #1,D6
+        CMP.L   #1000,D6
+        BNE.W   .sm_loop
+        RTS
+
+.disconnected
+        RTS
+
+
+;--- NS_RESET_BUS ---
+NS_RESET_BUS:
+        MOVE.B  #0,SCSI_ICR
+        MOVE.B  #0,SCSI_MR
+        MOVE.B  #$80,SCSI_ICR
+        MOVE.L  #200000,D0
+.rl     SUBQ.L  #1,D0
+        BNE.S   .rl
+        MOVE.B  #0,SCSI_ICR
+        MOVE.B  SCSI_RESET_REG,D0
+        RTS
+
+
+;--- NS_SELECT_TARGET - select D7 as target; returns D0=0 ok, D0=-1 empty ---
+NS_SELECT_TARGET:
+        MOVE.B  #0,SCSI_TCR
+        MOVE.B  #0,SCSI_MR
+        MOVEQ   #1,D0
+        LSL.L   #7,D0                    ; self = ID7 bit = $80
+        MOVEQ   #1,D1
+        MOVE.L  D7,D2
+        LSL.L   D2,D1                    ; target bit
+        OR.B    D1,D0
+        MOVE.B  D0,SCSI_ODR
+        MOVE.B  #$01,SCSI_ICR
+        MOVE.B  #$05,SCSI_ICR
+        MOVE.L  #1000000,D0
+.w
+        MOVE.B  SCSI_STATUS,D2
+        BTST    #STAT_BSY,D2
+        BNE.S   .matched
+        SUBQ.L  #1,D0
+        BNE.S   .w
+        MOVE.B  #0,SCSI_ICR
+        LEA     NS_STR_EMPTY,A0
+        BSR     PRINTSTR
+        MOVEQ   #-1,D0
+        RTS
+.matched
+        MOVE.B  #0,SCSI_ICR
+        MOVE.L  #10000,D0
+.d      SUBQ.L  #1,D0
+        BNE.S   .d
+        MOVEQ   #0,D0
+        RTS
+
+
+;--- NS_RELEASE_BUS ---
+NS_RELEASE_BUS:
+        MOVE.B  #0,SCSI_ICR
+        MOVE.B  #0,SCSI_TCR
+        RTS
+
+
+;--- NS_PRINT_DRIVE_INFO - print vendor/model/rev from NS_DATA_BUF ---
+NS_PRINT_DRIVE_INFO:
+        LEA     NS_STR_VENDOR,A0
+        BSR     PRINTSTR
+        LEA     NS_DATA_BUF+8,A0
+        MOVEQ   #7,D1
+.v      MOVE.B  (A0)+,D0
+        BSR     PUTCHAR
+        DBF     D1,.v
+        LEA     NS_STR_MODEL,A0
+        BSR     PRINTSTR
+        LEA     NS_DATA_BUF+16,A0
+        MOVEQ   #15,D1
+.m      MOVE.B  (A0)+,D0
+        BSR     PUTCHAR
+        DBF     D1,.m
+        LEA     NS_STR_REV,A0
+        BSR     PRINTSTR
+        LEA     NS_DATA_BUF+32,A0
+        MOVEQ   #3,D1
+.r      MOVE.B  (A0)+,D0
+        BSR     PUTCHAR
+        DBF     D1,.r
+        MOVE.B  #']',D0
+        BSR     PUTCHAR
+        BSR     PRINT_CRLF
+        RTS
+
+
+;--- NS_CALC_CAPACITY - print capacity in MB from READ CAPACITY response ---
+NS_CALC_CAPACITY:
+        MOVE.L  NS_DATA_BUF,D0           ; max LBA
+        ADDQ.L  #1,D0                    ; total blocks
+        LSR.L   #1,D0                    ; /2 - assumes 512-byte blocks → KB
+        MOVE.L  D0,D1
+        MOVEQ   #10,D2
+        LSR.L   D2,D1                    ; D1 = MB
+        LEA     NS_STR_CAP,A0
+        BSR     PRINTSTR
+        MOVE.L  D1,D0
+        BSR     NS_PRINT_DEC
+        LEA     NS_STR_MB,A0
+        BSR     PRINTSTR
+        RTS
+
+
+;--- NS_PRINT_GEOMETRY - print cylinders/heads from MODE SENSE page 04 ---
+NS_PRINT_GEOMETRY:
+        LEA     NS_DATA_BUF+4,A0
+        CMP.B   #$04,(A0)
+        BNE.S   .not_p4
+
+        LEA     NS_STR_CYLS,A0
+        BSR     PRINTSTR
+        MOVEQ   #0,D0
+        MOVE.B  NS_DATA_BUF+6,D0
+        LSL.L   #8,D0
+        MOVE.B  NS_DATA_BUF+7,D0
+        LSL.L   #8,D0
+        MOVE.B  NS_DATA_BUF+8,D0
+        BSR     NS_PRINT_DEC
+
+        LEA     NS_STR_HEADS,A0
+        BSR     PRINTSTR
+        MOVEQ   #0,D0
+        MOVE.B  NS_DATA_BUF+9,D0
+        BSR     NS_PRINT_DEC
+
+        BSR     PRINT_CRLF
+.not_p4
+        RTS
+
+
+;--- NS_PRINT_DEC - print D0.l as unsigned decimal ---
+NS_PRINT_DEC:
+        MOVEM.L D0-D3/A1,-(SP)
+        SUBA.W  #12,SP
+        LEA     12(SP),A1                ; point to TOP of buffer; -(A1) stores within it
+        MOVEQ   #0,D2
+        MOVEQ   #0,D3
+.lp
+        DIVU.L  #10,D3:D0
+        ADDI.B  #'0',D3
+        MOVE.B  D3,-(A1)
+        ADDQ.L  #1,D2
+        MOVEQ   #0,D3
+        TST.L   D0
+        BNE.S   .lp
+.pr
+        MOVE.B  (A1)+,D0
+        BSR     PUTCHAR
+        SUBQ.L  #1,D2
+        BNE.S   .pr
+        ADDA.W  #12,SP
+        MOVEM.L (SP)+,D0-D3/A1
+        RTS
+
+
+;--- SCSI string constants and CDB tables ---
+        EVEN
+NS_CDB_INQ:     DC.B    $12,0,0,0,36,0
+NS_CDB_CAP:     DC.B    $25,0,0,0,0,0,0,0,0,0
+NS_CDB_GEOM:    DC.B    $1A,0,$04,0,36,0
+
+NS_STR_ID:      DC.B    $0D,$0A,"ID ",0
+NS_STR_FOUND:   DC.B    " FOUND: ",0
+NS_STR_EMPTY:   DC.B    " empty",0
+NS_STR_CHECK:   DC.B    " (CHECK CONDITION)",$0D,$0A,0
+NS_STR_DONE:    DC.B    $0D,$0A,"Scan complete.",$0D,$0A,0
+NS_STR_VENDOR:  DC.B    "[",0
+NS_STR_MODEL:   DC.B    "] [",0
+NS_STR_REV:     DC.B    "] REV [",0
+NS_STR_CAP:     DC.B    " -> Capacity: ",0
+NS_STR_MB:      DC.B    " MB",$0D,$0A,0
+NS_STR_CYLS:    DC.B    " -> Geometry: Cyls [",0
+NS_STR_HEADS:   DC.B    "] Heads [",0
+
+
+;******************************************************************************
+;  VERA and NVRAM includes
+;  Must appear before EhBASIC (ehbasic68k.inc ends with END).
+;******************************************************************************
+
+        INCLUDE "include/nvram_config.inc"
+        INCLUDE "include/vera_init.inc"
+        INCLUDE "include/vera_text.inc"
+        INCLUDE "include/vera_cursor.inc"
+        INCLUDE "include/via_timer.inc"
+
+
+;******************************************************************************
+;  EhBASIC (Agfa hardware wrapper + core engine)
+;  Included LAST - ehbasic68k.inc ends with END which stops all assembly.
+;******************************************************************************
+
+        ORG     $001800
+        INCLUDE "agfa-basic.m68"

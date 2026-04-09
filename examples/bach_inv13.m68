@@ -1,0 +1,428 @@
+
+; Bach Invention 13 BWV 784 on Agfa 9000PS VERA PSG.
+; AGFA-MON loads at $02050000.  Plays both voices on PSG ch 0/1.
+; VIA1 Timer 1 paces at 100 Hz.  Press any key to abort.
+
+	ORG	$02050000
+
+PRINTSTR_VEC	EQU	$0412
+EXIT_VEC	EQU	$041E
+
+VT_MAGIC	EQU	$02000306
+VT_MAGIC_VAL	EQU	$A55A
+
+VERA_BASE	EQU	$04000020
+V_ADDR_L	EQU	0
+V_ADDR_M	EQU	1
+V_ADDR_H	EQU	2
+V_DATA0		EQU	3
+V_CTRL		EQU	5
+
+VIA1_BASE	EQU	$04000000
+VIA_T1CL	EQU	4
+VIA_T1CH	EQU	5
+VIA_ACR		EQU	$B
+VIA_IFR		EQU	$D
+
+SCC_A_CTRL	EQU	$07000002
+SCC_RX_CHAR	EQU	$01
+
+PSG_VRAM	EQU	$1F9C0
+
+V_AUDIO_CTRL	EQU	$1B
+V_AUDIO_RATE	EQU	$1C
+
+VT_CURSOR_EN	EQU	$0200030E
+
+; 1 MHz VIA clock / 100 Hz - 2 (VIA timing convention)
+TICK_COUNT	EQU	9998
+
+_start:
+	movem.l	d0-d7/a0-a6,-(sp)
+
+	; VERA present?
+	move.w	VT_MAGIC,d0
+	cmpi.w	#VT_MAGIC_VAL,d0
+	bne	vera_exit
+
+	; Print banner
+	lea	STR_BANNER(pc),a0
+	jsr	PRINTSTR_VEC
+	lea	STR_PLAYING(pc),a0
+	jsr	PRINTSTR_VEC
+
+	; Save + disable AGFA-MON cursor blink so its level-1 VSYNC ISR
+	; stops touching ADDR0/DATA0 between our PSG writes.
+	move.b	VT_CURSOR_EN,d0
+	move.b	d0,saved_cursor_en
+	move.b	#0,VT_CURSOR_EN
+	; Enable VERA master audio output (lower 4 bits = master volume).
+	; $4F = FIFO reset + master vol 15.  Without this PSG is silent.
+	move.b	#0,VERA_BASE+V_CTRL
+	move.b	#$4F,VERA_BASE+V_AUDIO_CTRL
+	move.b	#$0F,VERA_BASE+V_AUDIO_CTRL
+
+	; VIA1 T1 free-run @ 100 Hz
+	move.b	#$40,VIA1_BASE+VIA_ACR
+	move.b	#(TICK_COUNT&$FF),VIA1_BASE+VIA_T1CL
+	move.b	#(TICK_COUNT>>8),VIA1_BASE+VIA_T1CH
+
+	; Init all 4 channels: ch 0,1 = pulse 50%, ch 2,3 = triangle
+	moveq	#0,d0
+	bsr	psg_channel_init
+	moveq	#1,d0
+	bsr	psg_channel_init
+	moveq	#2,d0
+	bsr	psg_channel_init
+	moveq	#3,d0
+	bsr	psg_channel_init
+
+	lea	voice1_table(pc),a2
+	lea	voice2_table(pc),a3
+	moveq	#0,d2
+	moveq	#0,d3
+
+main_loop:
+	; Keypress -> exit
+	move.b	SCC_A_CTRL,d0
+	andi.b	#SCC_RX_CHAR,d0
+	bne	done
+
+	; Voice 1 advance?
+	tst.w	d2
+	bne	v1_alive
+	move.w	(a2)+,d4
+	move.w	(a2)+,d2
+	tst.w	d2
+	beq	v1_done
+	moveq	#0,d0
+	move.w	d4,d1
+	bsr	psg_set_freq
+	moveq	#2,d0
+	move.w	d4,d1
+	bsr	psg_set_freq
+v1_alive:
+v1_done:
+
+	; Voice 2 advance?
+	tst.w	d3
+	bne	v2_alive
+	move.w	(a3)+,d4
+	move.w	(a3)+,d3
+	tst.w	d3
+	beq	v2_done
+	moveq	#1,d0
+	move.w	d4,d1
+	bsr	psg_set_freq
+	moveq	#3,d0
+	move.w	d4,d1
+	bsr	psg_set_freq
+v2_alive:
+v2_done:
+
+	; Both done?
+	tst.w	d2
+	bne	wait_tick
+	tst.w	d3
+	beq	done
+
+wait_tick:
+.poll	btst	#6,VIA1_BASE+VIA_IFR
+	beq	.poll
+	move.b	VIA1_BASE+VIA_T1CL,d0
+
+	tst.w	d2
+	beq	.skip1
+	subq.w	#1,d2
+.skip1	tst.w	d3
+	beq	main_loop
+	subq.w	#1,d3
+	bra	main_loop
+
+done	moveq	#0,d0
+	moveq	#0,d1
+	bsr	psg_set_freq
+	moveq	#1,d0
+	moveq	#0,d1
+	bsr	psg_set_freq
+	moveq	#2,d0
+	moveq	#0,d1
+	bsr	psg_set_freq
+	moveq	#3,d0
+	moveq	#0,d1
+	bsr	psg_set_freq
+
+	; Restore AGFA-MON cursor
+	move.b	saved_cursor_en,d0
+	move.b	d0,VT_CURSOR_EN
+
+	lea	STR_DONE(pc),a0
+	jsr	PRINTSTR_VEC
+
+	movem.l	(sp)+,d0-d7/a0-a6
+	jmp	EXIT_VEC
+
+vera_exit:
+	lea	STR_NO_VERA(pc),a0
+	jsr	PRINTSTR_VEC
+	movem.l	(sp)+,d0-d7/a0-a6
+	jmp	EXIT_VEC
+
+	EVEN
+saved_cursor_en:
+	dc.b	0
+	EVEN
+
+
+; psg_channel_init(d0=ch) - ch 0,1: pulse 50%, ch 2,3: sawtooth, vol=0
+psg_channel_init:
+	movem.l	d0-d3,-(sp)
+	move.l	d0,d2
+	lsl.w	#2,d2
+	add.l	#PSG_VRAM,d2
+
+	move.b	#0,VERA_BASE+V_CTRL
+	move.b	d2,VERA_BASE+V_ADDR_L
+	move.l	d2,d3
+	lsr.l	#8,d3
+	move.b	d3,VERA_BASE+V_ADDR_M
+	lsr.l	#8,d3
+	andi.b	#1,d3
+	ori.b	#(2<<3),d3
+	move.b	#$11,VERA_BASE+V_ADDR_H
+
+	move.b	#0,VERA_BASE+V_DATA0
+	move.b	#0,VERA_BASE+V_DATA0
+	move.b	#0,VERA_BASE+V_DATA0
+	btst	#1,d0
+	bne.s	.saw_init
+	move.b	#$20,VERA_BASE+V_DATA0
+	bra.s	.init_done
+.saw_init
+	move.b	#$7F,VERA_BASE+V_DATA0
+.init_done
+
+	movem.l	(sp)+,d0-d3
+	rts
+
+; psg_set_freq(d0=ch, d1=freq) - d1==0 mutes.
+; ch 0,2 = left, ch 1,3 = right.  ch 0,1 = pulse, ch 2,3 = sawtooth.
+psg_set_freq:
+	movem.l	d0-d4,-(sp)
+	move.w	d1,d4
+	btst	#1,d0
+	beq.s	.no_octave
+	lsr.w	#1,d4
+.no_octave
+	move.l	d0,d2
+	lsl.w	#2,d2
+	add.l	#PSG_VRAM,d2
+
+	move.b	#0,VERA_BASE+V_CTRL
+	move.b	d2,VERA_BASE+V_ADDR_L
+	move.l	d2,d3
+	lsr.l	#8,d3
+	move.b	d3,VERA_BASE+V_ADDR_M
+	lsr.l	#8,d3
+	andi.b	#1,d3
+	ori.b	#(2<<3),d3
+	move.b	#$11,VERA_BASE+V_ADDR_H
+
+	move.b	d4,VERA_BASE+V_DATA0
+	move.w	d4,d3
+	lsr.w	#8,d3
+	move.b	d3,VERA_BASE+V_DATA0
+	tst.w	d4
+	beq.s	.mute
+	btst	#0,d0
+	bne.s	.right_play
+	move.b	#$7F,VERA_BASE+V_DATA0
+	bra.s	.waveform
+.right_play
+	move.b	#$BF,VERA_BASE+V_DATA0
+	bra.s	.waveform
+.mute	btst	#0,d0
+	bne.s	.right_mute
+	move.b	#$40,VERA_BASE+V_DATA0
+	bra.s	.waveform
+.right_mute
+	move.b	#$80,VERA_BASE+V_DATA0
+.waveform
+	btst	#1,d0
+	bne.s	.saw_pw
+	move.b	#$20,VERA_BASE+V_DATA0
+	bra.s	.pw_done
+.saw_pw
+	move.b	#$7F,VERA_BASE+V_DATA0
+.pw_done
+
+	movem.l	(sp)+,d0-d4
+	rts
+
+	EVEN
+
+STR_NO_VERA:
+	dc.b	"VERA not detected - PSG audio requires VERA hardware.",13,10,0
+STR_BANNER:
+	dc.b	"Bach Invention No. 13 in A minor (BWV 784)",13,10,0
+STR_PLAYING:
+	dc.b	"Playing on VERA PSG (pulse+sawtooth, L/R stereo, vol max) ... press any key to stop.",13,10,0
+STR_DONE:
+	dc.b	13,10,"Playback complete.",13,10,0
+
+	EVEN
+voice1_table:
+	dc.b	$00,$00,$00,$0f,$03,$75,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$03,$75,$00,$0f,$05,$2e,$00,$0f,$06,$29,$00,$0f
+	dc.b	$05,$7d,$00,$1e,$06,$ea,$00,$1e,$04,$5b,$00,$1e,$06,$ea,$00,$1e
+	dc.b	$04,$9d,$00,$0f,$03,$75,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$03,$75,$00,$0f,$05,$2e,$00,$0f,$06,$29,$00,$0f
+	dc.b	$05,$7d,$00,$1e,$04,$9d,$00,$1e,$00,$00,$00,$3c,$00,$00,$00,$0f
+	dc.b	$06,$ea,$00,$0f,$05,$7d,$00,$0f,$06,$ea,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$03,$75,$00,$0f,$04,$1c,$00,$0f,$03,$a9,$00,$1e
+	dc.b	$04,$9d,$00,$1e,$06,$29,$00,$1e,$07,$53,$00,$2d,$06,$29,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$04,$1c,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$03,$14,$00,$0f,$03,$a9,$00,$0f,$03,$75,$00,$1e,$04,$1c,$00,$1e
+	dc.b	$05,$7d,$00,$1e,$06,$ea,$00,$2d,$05,$7d,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$03,$a9,$00,$1e,$06,$29,$00,$2d,$05,$2e,$00,$0f
+	dc.b	$04,$1c,$00,$0f,$05,$2e,$00,$0f,$03,$75,$00,$1e,$05,$7d,$00,$2d
+	dc.b	$04,$9d,$00,$0f,$03,$a9,$00,$0f,$04,$9d,$00,$0f,$03,$14,$00,$1e
+	dc.b	$05,$2e,$00,$1e,$05,$7d,$00,$1e,$00,$00,$00,$1e,$00,$00,$00,$3c
+	dc.b	$00,$00,$00,$0f,$04,$1c,$00,$0f,$05,$7d,$00,$0f,$06,$ea,$00,$0f
+	dc.b	$06,$29,$00,$0f,$04,$1c,$00,$0f,$06,$29,$00,$0f,$07,$53,$00,$0f
+	dc.b	$06,$ea,$00,$1e,$08,$39,$00,$1e,$05,$2e,$00,$1e,$08,$39,$00,$1e
+	dc.b	$05,$7d,$00,$0f,$04,$1c,$00,$0f,$05,$7d,$00,$0f,$06,$ea,$00,$0f
+	dc.b	$06,$29,$00,$0f,$04,$1c,$00,$0f,$06,$29,$00,$0f,$07,$53,$00,$0f
+	dc.b	$06,$ea,$00,$1e,$05,$7d,$00,$1e,$08,$39,$00,$1e,$06,$ea,$00,$1e
+	dc.b	$0a,$f9,$00,$0f,$09,$3a,$00,$0f,$06,$ea,$00,$0f,$09,$3a,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$06,$ea,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$29,$00,$1e,$07,$c2,$00,$1e,$09,$3a,$00,$1e,$0a,$f9,$00,$1e
+	dc.b	$0a,$5c,$00,$0f,$08,$39,$00,$0f,$06,$29,$00,$0f,$08,$39,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$04,$1c,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$05,$7d,$00,$1e,$06,$ea,$00,$1e,$08,$39,$00,$1e,$0a,$5c,$00,$1e
+	dc.b	$09,$3a,$00,$0f,$07,$c2,$00,$0f,$06,$86,$00,$0f,$07,$c2,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$86,$00,$0f,$03,$e1,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$04,$1c,$00,$1e,$08,$39,$00,$2d,$06,$ea,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$ea,$00,$0f,$04,$9d,$00,$1e,$07,$c2,$00,$2d,$06,$29,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$04,$1c,$00,$1e,$06,$ea,$00,$2d
+	dc.b	$05,$7d,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f,$03,$e1,$00,$0f
+	dc.b	$08,$39,$00,$0f,$07,$c2,$00,$0f,$06,$ea,$00,$0f,$06,$86,$00,$0f
+	dc.b	$07,$c2,$00,$0f,$05,$2e,$00,$0f,$06,$86,$00,$0f,$06,$ea,$00,$1e
+	dc.b	$00,$00,$00,$1e,$00,$00,$00,$3c,$00,$00,$00,$0f,$08,$39,$00,$0f
+	dc.b	$09,$c7,$00,$0f,$08,$39,$00,$0f,$06,$ea,$00,$0f,$08,$39,$00,$0f
+	dc.b	$05,$d0,$00,$0f,$06,$ea,$00,$0f,$08,$39,$00,$0f,$06,$ea,$00,$0f
+	dc.b	$05,$d0,$00,$0f,$06,$ea,$00,$0f,$04,$9d,$00,$0f,$00,$00,$00,$0f
+	dc.b	$00,$00,$00,$1e,$00,$00,$00,$0f,$07,$53,$00,$0f,$09,$3a,$00,$0f
+	dc.b	$07,$53,$00,$0f,$06,$29,$00,$0f,$07,$53,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$06,$29,$00,$0f,$07,$53,$00,$0f,$06,$29,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$06,$29,$00,$0f,$04,$1c,$00,$0f,$00,$00,$00,$0f,$00,$00,$00,$1e
+	dc.b	$00,$00,$00,$0f,$06,$ea,$00,$0f,$08,$39,$00,$0f,$06,$ea,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$06,$ea,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$86,$00,$0f,$05,$7d,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$03,$e1,$00,$0f,$00,$00,$00,$0f,$00,$00,$00,$1e,$00,$00,$00,$0f
+	dc.b	$06,$29,$00,$0f,$07,$53,$00,$0f,$06,$29,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$06,$29,$00,$0f,$04,$5b,$00,$0f,$05,$2e,$00,$0f,$06,$29,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$04,$5b,$00,$0f,$05,$2e,$00,$0f,$03,$75,$00,$0f
+	dc.b	$00,$00,$00,$0f,$00,$00,$00,$1e,$00,$00,$00,$0f,$03,$75,$00,$0f
+	dc.b	$04,$9d,$00,$0f,$05,$7d,$00,$0f,$05,$2e,$00,$0f,$03,$75,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$05,$7d,$00,$1e,$04,$9d,$00,$1e
+	dc.b	$04,$5b,$00,$1e,$03,$75,$00,$1e,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$ea,$00,$0f,$05,$7d,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$03,$e1,$00,$0f,$04,$9d,$00,$0f,$05,$7d,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$03,$e1,$00,$0f,$04,$9d,$00,$0f,$03,$43,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$04,$9d,$00,$0f,$04,$5b,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$06,$29,$00,$0f,$05,$2e,$00,$0f,$04,$5b,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$03,$14,$00,$0f,$03,$a9,$00,$0f,$04,$5b,$00,$0f,$03,$a9,$00,$0f
+	dc.b	$03,$14,$00,$0f,$03,$a9,$00,$0f,$02,$97,$00,$0f,$03,$a9,$00,$0f
+	dc.b	$03,$75,$00,$0f,$03,$14,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f
+	dc.b	$04,$9d,$00,$0f,$03,$75,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$02,$be,$00,$0f,$03,$43,$00,$0f,$02,$be,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$02,$be,$00,$0f,$01,$f1,$00,$0f,$02,$be,$00,$0f
+	dc.b	$02,$97,$00,$0f,$02,$4f,$00,$0f,$02,$2d,$00,$1e,$05,$2e,$00,$1e
+	dc.b	$04,$5b,$00,$1e,$03,$75,$00,$1e,$00,$00,$00,$0f,$03,$75,$00,$0f
+	dc.b	$04,$9d,$00,$0f,$05,$7d,$00,$0f,$05,$2e,$00,$0f,$03,$75,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$05,$7d,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$06,$ea,$00,$0f,$06,$29,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$06,$29,$00,$0f,$07,$53,$00,$0f,$06,$ea,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$ea,$00,$0f,$08,$39,$00,$0f,$07,$53,$00,$0f,$06,$ea,$00,$0f
+	dc.b	$06,$29,$00,$0f,$05,$7d,$00,$0f,$05,$2e,$00,$0f,$05,$7d,$00,$0f
+	dc.b	$06,$29,$00,$0f,$06,$ea,$00,$0f,$07,$53,$00,$0f,$06,$29,$00,$0f
+	dc.b	$08,$b6,$00,$0f,$06,$29,$00,$0f,$0a,$5c,$00,$0f,$06,$29,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$09,$3a,$00,$0f,$07,$53,$00,$0f,$06,$29,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$06,$29,$00,$0f,$04,$5b,$00,$0f,$05,$2e,$00,$0f
+	dc.b	$05,$7d,$00,$0f,$04,$9d,$00,$0f,$03,$75,$00,$0f,$04,$9d,$00,$0f
+	dc.b	$05,$2e,$00,$0f,$04,$5b,$00,$0f,$04,$9d,$00,$0f,$03,$75,$00,$0f
+	dc.b	$02,$be,$00,$0f,$03,$75,$00,$0f,$02,$4f,$00,$3c,$00,$00,$00,$00
+
+	EVEN
+voice2_table:
+	dc.b	$01,$27,$00,$1e,$02,$4f,$00,$3c,$02,$2d,$00,$1e,$02,$4f,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$4f,$00,$0f,$02,$be,$00,$0f,$02,$97,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$97,$00,$0f,$03,$14,$00,$0f,$02,$be,$00,$1e
+	dc.b	$02,$4f,$00,$1e,$02,$2d,$00,$1e,$01,$ba,$00,$1e,$02,$4f,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$4f,$00,$0f,$02,$be,$00,$0f,$02,$97,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$97,$00,$0f,$03,$14,$00,$0f,$02,$be,$00,$1e
+	dc.b	$02,$4f,$00,$1e,$02,$be,$00,$1e,$02,$4f,$00,$1e,$03,$14,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$01,$d5,$00,$0f,$02,$4f,$00,$0f,$01,$8a,$00,$0f
+	dc.b	$01,$d5,$00,$0f,$01,$27,$00,$0f,$01,$5f,$00,$0f,$01,$4b,$00,$1e
+	dc.b	$01,$8a,$00,$1e,$02,$0e,$00,$1e,$02,$97,$00,$2d,$02,$0e,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$0e,$00,$0f,$01,$5f,$00,$0f,$01,$ba,$00,$0f
+	dc.b	$01,$07,$00,$0f,$01,$4b,$00,$0f,$01,$27,$00,$1e,$01,$5f,$00,$1e
+	dc.b	$01,$8a,$00,$0f,$01,$d5,$00,$0f,$01,$4b,$00,$0f,$01,$8a,$00,$0f
+	dc.b	$01,$07,$00,$1e,$01,$4b,$00,$1e,$01,$5f,$00,$0f,$01,$ba,$00,$0f
+	dc.b	$01,$27,$00,$0f,$01,$5f,$00,$0f,$00,$ea,$00,$1e,$00,$c5,$00,$1e
+	dc.b	$01,$07,$00,$0f,$02,$0e,$00,$0f,$01,$d5,$00,$0f,$02,$0e,$00,$0f
+	dc.b	$01,$5f,$00,$0f,$02,$0e,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f
+	dc.b	$03,$14,$00,$0f,$02,$0e,$00,$0f,$03,$14,$00,$0f,$03,$a9,$00,$0f
+	dc.b	$03,$75,$00,$1e,$02,$be,$00,$1e,$02,$97,$00,$1e,$02,$0e,$00,$1e
+	dc.b	$02,$be,$00,$0f,$02,$0e,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f
+	dc.b	$03,$14,$00,$0f,$02,$0e,$00,$0f,$03,$14,$00,$0f,$03,$a9,$00,$0f
+	dc.b	$03,$75,$00,$1e,$02,$be,$00,$1e,$00,$00,$00,$3c,$00,$00,$00,$0f
+	dc.b	$04,$1c,$00,$0f,$03,$75,$00,$0f,$04,$1c,$00,$0f,$02,$be,$00,$0f
+	dc.b	$03,$75,$00,$0f,$02,$0e,$00,$0f,$02,$97,$00,$0f,$02,$4f,$00,$1e
+	dc.b	$02,$be,$00,$1e,$03,$75,$00,$1e,$04,$1c,$00,$1e,$03,$e1,$00,$0f
+	dc.b	$04,$9d,$00,$0f,$03,$14,$00,$0f,$03,$e1,$00,$0f,$02,$4f,$00,$0f
+	dc.b	$03,$14,$00,$0f,$01,$f1,$00,$0f,$02,$4f,$00,$0f,$02,$0e,$00,$1e
+	dc.b	$02,$97,$00,$1e,$03,$14,$00,$1e,$03,$e1,$00,$1e,$03,$75,$00,$0f
+	dc.b	$04,$1c,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f,$02,$0e,$00,$0f
+	dc.b	$02,$be,$00,$0f,$01,$ba,$00,$0f,$02,$0e,$00,$0f,$01,$f1,$00,$1e
+	dc.b	$02,$4f,$00,$1e,$02,$97,$00,$1e,$03,$43,$00,$1e,$00,$00,$00,$0f
+	dc.b	$03,$75,$00,$0f,$02,$be,$00,$0f,$03,$75,$00,$0f,$02,$4f,$00,$0f
+	dc.b	$02,$be,$00,$0f,$03,$75,$00,$0f,$04,$1c,$00,$0f,$03,$e1,$00,$0f
+	dc.b	$03,$14,$00,$0f,$02,$97,$00,$0f,$03,$14,$00,$0f,$02,$0e,$00,$0f
+	dc.b	$02,$97,$00,$0f,$03,$14,$00,$0f,$03,$e1,$00,$0f,$03,$75,$00,$0f
+	dc.b	$02,$be,$00,$0f,$02,$4f,$00,$0f,$02,$be,$00,$0f,$01,$f1,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$02,$be,$00,$2d,$02,$97,$00,$0f,$02,$be,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$02,$97,$00,$1e,$01,$4b,$00,$1e,$01,$ba,$00,$0f
+	dc.b	$03,$75,$00,$0f,$02,$97,$00,$0f,$02,$0e,$00,$0f,$01,$ba,$00,$0f
+	dc.b	$01,$4b,$00,$0f,$01,$07,$00,$0f,$01,$4b,$00,$0f,$00,$dd,$00,$1e
+	dc.b	$01,$ba,$00,$1e,$02,$0e,$00,$1e,$02,$72,$00,$1e,$01,$74,$00,$1e
+	dc.b	$00,$00,$00,$1e,$00,$00,$00,$0f,$04,$1c,$00,$0f,$03,$a9,$00,$0f
+	dc.b	$03,$75,$00,$0f,$03,$14,$00,$1e,$01,$8a,$00,$1e,$01,$d5,$00,$1e
+	dc.b	$02,$2d,$00,$1e,$01,$4b,$00,$1e,$00,$00,$00,$1e,$00,$00,$00,$0f
+	dc.b	$03,$a9,$00,$0f,$03,$75,$00,$0f,$03,$14,$00,$0f,$02,$be,$00,$1e
+	dc.b	$01,$5f,$00,$1e,$01,$ba,$00,$1e,$01,$f1,$00,$1e,$01,$27,$00,$1e
+	dc.b	$00,$00,$00,$1e,$00,$00,$00,$0f,$03,$75,$00,$0f,$03,$43,$00,$0f
+	dc.b	$02,$e8,$00,$0f,$02,$97,$00,$1e,$01,$4b,$00,$1e,$01,$8a,$00,$1e
+	dc.b	$01,$d5,$00,$1e,$01,$17,$00,$1e,$00,$00,$00,$1e,$00,$00,$00,$0f
+	dc.b	$03,$14,$00,$0f,$02,$be,$00,$0f,$02,$97,$00,$0f,$02,$be,$00,$1e
+	dc.b	$02,$4f,$00,$1e,$02,$2d,$00,$1e,$01,$ba,$00,$1e,$02,$4f,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$4f,$00,$0f,$02,$be,$00,$0f,$02,$97,$00,$0f
+	dc.b	$01,$ba,$00,$0f,$02,$97,$00,$0f,$03,$14,$00,$0f,$02,$be,$00,$0f
+	dc.b	$03,$75,$00,$0f,$04,$9d,$00,$0f,$03,$75,$00,$0f,$02,$be,$00,$0f
+	dc.b	$03,$75,$00,$0f,$02,$4f,$00,$0f,$02,$be,$00,$0f,$01,$f1,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$02,$be,$00,$0f,$02,$4f,$00,$0f,$01,$f1,$00,$0f
+	dc.b	$02,$4f,$00,$0f,$01,$a2,$00,$0f,$01,$f1,$00,$0f,$01,$ba,$00,$1e
+	dc.b	$02,$2d,$00,$1e,$02,$97,$00,$1e,$02,$2d,$00,$1e,$01,$ba,$00,$1e
+	dc.b	$01,$4b,$00,$1e,$01,$17,$00,$1e,$00,$dd,$00,$1e,$01,$27,$00,$1e
+	dc.b	$01,$5f,$00,$1e,$01,$ba,$00,$1e,$01,$5f,$00,$1e,$01,$27,$00,$1e
+	dc.b	$01,$5f,$00,$1e,$00,$d1,$00,$1e,$00,$00,$00,$1e,$00,$00,$00,$0f
+	dc.b	$02,$97,$00,$0f,$02,$2d,$00,$0f,$01,$ba,$00,$0f,$01,$8a,$00,$0f
+	dc.b	$02,$97,$00,$0f,$02,$2d,$00,$0f,$01,$8a,$00,$0f,$01,$5f,$00,$1e
+	dc.b	$01,$ba,$00,$1e,$01,$17,$00,$1e,$01,$ba,$00,$1e,$01,$27,$00,$1e
+	dc.b	$01,$f1,$00,$1e,$01,$4b,$00,$1e,$02,$2d,$00,$1e,$01,$5f,$00,$1e
+	dc.b	$02,$4f,$00,$1e,$01,$8a,$00,$1e,$02,$72,$00,$1e,$02,$2d,$00,$1e
+	dc.b	$01,$d5,$00,$1e,$01,$8a,$00,$1e,$01,$4b,$00,$1e,$01,$17,$00,$1e
+	dc.b	$01,$27,$00,$1e,$00,$c5,$00,$1e,$00,$dd,$00,$1e,$00,$ea,$00,$1e
+	dc.b	$00,$d1,$00,$1e,$00,$dd,$00,$1e,$01,$ba,$00,$1e,$01,$27,$00,$78
+	dc.b	$00,$00,$00,$00

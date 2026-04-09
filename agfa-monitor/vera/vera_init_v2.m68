@@ -1,0 +1,326 @@
+; =====================================================================
+; VERA Text Mode Init - Version 2 (FULLY DYNAMIC NVRAM LOADER)
+; Target: Agfa 9000PS (68020)
+; =====================================================================
+
+    ORG $02050000
+
+; --- Monitor API / Vectors ---
+PUTCHAR_SERIAL      EQU $0406
+EXIT_PROG           EQU $041E
+
+; --- VERA Hardware Registers ---
+VERA_BASE           EQU $04000020
+VERA_ADDR0_L        EQU $00
+VERA_ADDR0_M        EQU $01
+VERA_ADDR0_H        EQU $02
+VERA_DATA0          EQU $03
+VERA_CTRL           EQU $05
+VERA_DC_VIDEO       EQU $09
+VERA_DC_HSCALE      EQU $0A
+VERA_DC_VSCALE      EQU $0B
+VERA_DC_BORDER      EQU $0C
+VERA_L0_CONFIG      EQU $0D
+VERA_L0_MAPBASE     EQU $0E
+VERA_L0_TILEBASE    EQU $0F
+VERA_L0_VSCROLL_L   EQU $12
+VERA_L0_VSCROLL_H   EQU $13
+
+; --- NVRAM Configuration (Xicor X2804A) ---
+NV_BASE             EQU $07100000
+NV_MAGIC            EQU NV_BASE+$00     ; Expected: $A5
+NV_CHECKSUM         EQU NV_BASE+$01     ; Sum of bytes $02-$2F
+NV_DC_VIDEO_VAL     EQU NV_BASE+$03
+NV_TERM_WIDTH       EQU NV_BASE+$08
+NV_TERM_HEIGHT      EQU NV_BASE+$09
+NV_DC_HSCALE_VAL    EQU NV_BASE+$0A
+NV_DC_VSCALE_VAL    EQU NV_BASE+$0B
+NV_DC_VSTART_VAL    EQU NV_BASE+$0C
+NV_DC_VSTOP_VAL     EQU NV_BASE+$0D
+NV_DC_BORDER_VAL    EQU NV_BASE+$0E
+NV_TEXT_ATTR_VAL    EQU NV_BASE+$0F
+
+; --- Console Control Block (CCB) - ALIGNED TO MEMORY MAP ---
+; Location: $02000300 - $0200030F
+V_VAR_BASE          EQU $02000300
+V_CUR_COL           EQU V_VAR_BASE+0    ; Word (0-79)
+V_CUR_ROW           EQU V_VAR_BASE+2    ; Word (0-63)
+V_SCROLL_ROW        EQU V_VAR_BASE+4    ; Word (0-63)
+V_MAGIC             EQU V_VAR_BASE+6    ; Word ($A55A)
+V_TEXT_ATTR         EQU V_VAR_BASE+8    ; Byte (Color)
+V_VIEW_H            EQU V_VAR_BASE+9    ; Byte (Rows visible, e.g., 30)
+V_MAP_H             EQU V_VAR_BASE+10   ; Byte (Total rows in map, e.g., 64)
+V_FLAGS             EQU V_VAR_BASE+11   ; Byte (Bits: [7]Scroll, [6]Wrap)
+
+V_MAGIC_VAL         EQU $A55A
+
+START:
+    MOVEM.L D0-D7/A0-A6,-(SP)
+
+    ; 1. VALIDATE NVRAM INTEGRITY
+    MOVE.B  NV_MAGIC,D0
+    CMPI.B  #$A5,D0
+    BEQ.S   .magic_ok
+    LEA     STR_ERR_MAGIC,A0
+    BRA.W   FATAL_ERROR
+
+.magic_ok:
+    ; Compute Sum-8 Checksum of bytes $02 to $27 (38 bytes)
+    MOVEQ   #0,D1           ; Sum
+    MOVEQ   #37,D2          ; DBRA count (38 bytes)
+    LEA     NV_BASE+$02,A0
+.chk_loop:
+    MOVE.B  (A0)+,D0
+    ADD.B   D0,D1
+    DBRA    D2,.chk_loop
+    
+    CMP.B   NV_CHECKSUM,D1
+    BEQ.S   .checksum_ok
+    LEA     STR_ERR_CHKSUM,A0
+    BRA.W   FATAL_ERROR
+
+.checksum_ok:
+    ; 2. PRE-INITIALIZE CONSOLE STATE (CCB)
+    MOVE.W  #10,V_CUR_COL                   ; Start at Column 10 (Margin)
+    MOVE.W  #5,V_CUR_ROW                    ; Start at Row 5
+    MOVE.W  #0,V_SCROLL_ROW
+    
+    ; Pull dynamic terminal colors/size from NVRAM
+    MOVE.B  NV_TEXT_ATTR_VAL,V_TEXT_ATTR
+    MOVE.B  NV_TERM_HEIGHT,V_VIEW_H
+    MOVE.B  #64,V_MAP_H                     ; Tile map is always 64 rows
+    MOVE.B  #$C0,V_FLAGS                    ; Scroll Enable, Wrap Enable
+    
+    MOVE.W  #V_MAGIC_VAL,V_MAGIC            ; Arm for persistence
+
+    ; 3. SERIAL BANNER
+    LEA     STR_HDR,A0
+    BSR     PRINT_SERIAL_STR
+
+    ; 4. SOFT RESET VERA (STRICT V1 DELAYS)
+    MOVE.B  #$80,VERA_BASE+VERA_CTRL
+    MOVE.L  #$3FFFF,D1
+.delay1:    SUBQ.L  #1,D1
+    BNE.S   .delay1
+    MOVE.B  #$00,VERA_BASE+VERA_CTRL
+    MOVE.L  #$3FFFF,D1
+.delay2:    SUBQ.L  #1,D1
+    BNE.S   .delay2
+
+    ; 5. DISPLAY COMPOSER SETUP (DYNAMIC FROM NVRAM)
+    MOVE.B  #$00,VERA_BASE+VERA_CTRL        ; DCSEL=0
+    MOVE.B  NV_DC_HSCALE_VAL,VERA_BASE+VERA_DC_HSCALE 
+    MOVE.B  NV_DC_VSCALE_VAL,VERA_BASE+VERA_DC_VSCALE
+    MOVE.B  NV_DC_BORDER_VAL,VERA_BASE+VERA_DC_BORDER
+    
+    MOVE.B  #$02,VERA_BASE+VERA_CTRL        ; DCSEL=1
+    MOVE.B  #0,VERA_BASE+VERA_DC_VIDEO      ; HSTART = 0 ($09)
+    MOVE.B  #160,VERA_BASE+VERA_DC_HSCALE   ; HSTOP = 160 ($0A) (640 pixels)
+    MOVE.B  NV_DC_VSTART_VAL,VERA_BASE+VERA_DC_VSCALE ; VSTART ($0B)
+    MOVE.B  NV_DC_VSTOP_VAL,VERA_BASE+VERA_DC_BORDER  ; VSTOP ($0C)
+    
+    MOVE.B  #$00,VERA_BASE+VERA_CTRL        ; DCSEL=0
+    
+    ; LOAD VIDEO MODE FROM NVRAM
+    MOVE.B  NV_DC_VIDEO_VAL,D0
+    ORI.B   #$10,D0                         ; Ensure Layer 0 is enabled
+    MOVE.B  D0,VERA_BASE+VERA_DC_VIDEO
+
+    ; 6. PALETTE SETUP (STANDARD COLOR SET)
+    MOVE.B  #$00,VERA_BASE+VERA_ADDR0_L
+    MOVE.B  #$FA,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$11,VERA_BASE+VERA_ADDR0_H     ; addr=$1FA00, stride=1
+    
+    LEA     PAL_DATA,A1
+    MOVE.W  #511,D1
+.pal_loop:
+    MOVE.B  (A1)+,VERA_BASE+VERA_DATA0
+    DBRA    D1,.pal_loop
+
+    ; 7. UPLOAD FONT
+    MOVE.B  #$00,VERA_BASE+VERA_ADDR0_L
+    MOVE.B  #$F0,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H     ; addr=$0F000, stride=1
+    
+    LEA     FONT_DATA,A1
+    MOVE.W  #2047,D1
+.copy_font:
+    MOVE.B  (A1)+,VERA_BASE+VERA_DATA0
+    DBRA    D1,.copy_font
+
+    ; 8. LAYER 0 SETUP
+    MOVE.B  #$60,VERA_BASE+VERA_L0_CONFIG   ; 128x64 Map, 1-bit Tile
+    MOVE.B  #$00,VERA_BASE+VERA_L0_MAPBASE  ; Map at $00000
+    MOVE.B  #$78,VERA_BASE+VERA_L0_TILEBASE ; Tiles at $0F000
+
+    ; 9. CLEAR MAP (8192 CHARS)
+    MOVE.B  #$00,VERA_BASE+VERA_ADDR0_L
+    MOVE.B  #$00,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H
+    
+    MOVE.W  #8191,D1
+.clear_map:
+    MOVE.B  #$20,VERA_BASE+VERA_DATA0       ; Space
+    MOVE.B  V_TEXT_ATTR,VERA_BASE+VERA_DATA0 ; attribute (Dynamic from NVRAM)
+    DBRA    D1,.clear_map
+
+    ; 10. PRINT AGFA BANNER
+    LEA     STR_VERA_BANNER,A0
+    BSR     VERA_PRINTSTR_MARGINS
+
+    ; Optional: Extra LF before charset
+    MOVE.B  #$0A,D0
+    BSR     VERA_PUTCHAR_MARGINS
+
+    ; 11. PRINT FONT STRESS TEST (RAW)
+    MOVEQ   #0,D1
+.char_test:
+    MOVE.B  D1,D0
+    BSR     VERA_PUTCHAR_RAW
+    ADDQ.B  #1,D1
+    BCC.W   .char_test
+
+    LEA     STR_DONE,A0
+    BSR     PRINT_SERIAL_STR
+
+    MOVEM.L (SP)+,D0-D7/A0-A6
+    JMP     EXIT_PROG
+
+; =====================================================================
+; SUPPORT ROUTINES
+; =====================================================================
+
+FATAL_ERROR:
+    BSR     PRINT_SERIAL_STR
+    LEA     STR_HALT,A0
+    BSR     PRINT_SERIAL_STR
+    MOVEM.L (SP)+,D0-D7/A0-A6
+    JMP     EXIT_PROG
+
+PRINT_SERIAL_STR:
+    MOVE.B  (A0)+,D0
+    TST.B   D0
+    BEQ.S   .done_ser
+    JSR     PUTCHAR_SERIAL
+    BRA.S   PRINT_SERIAL_STR
+.done_ser:
+    RTS
+
+VERA_PRINTSTR_MARGINS:
+    MOVE.B  (A0)+,D0
+    TST.B   D0
+    BEQ.S   .done_v
+    BSR     VERA_PUTCHAR_MARGINS
+    BRA.S   VERA_PRINTSTR_MARGINS
+.done_v:
+    RTS
+
+VERA_PUTCHAR_RAW:
+    MOVEM.L D0-D2/A0,-(SP)
+    MOVE.B  D0,D1
+    BRA.S   VERA_WRITE_BYTE
+
+VERA_PUTCHAR_MARGINS:
+    MOVEM.L D0-D2/A0,-(SP)
+    MOVE.B  D0,D1
+    CMPI.B  #$0D,D1
+    BNE.S   .not_cr
+    MOVE.W  #10,V_CUR_COL                   ; Return to Column 10
+    BRA.S   VERA_PUT_DONE
+.not_cr:
+    CMPI.B  #$0A,D1
+    BNE.S   .not_lf
+    BSR.S   VERA_ADVANCE_ROW
+    MOVE.W  #10,V_CUR_COL                   ; Margin after Line Feed
+    BRA.S   VERA_PUT_DONE
+.not_lf:
+VERA_WRITE_BYTE:
+    MOVE.W  V_CUR_ROW,D0
+    MOVE.L  #0,D2
+    MOVE.W  D0,D2
+    LSL.L   #8,D2
+    MOVE.W  V_CUR_COL,D0
+    LSL.W   #1,D0
+    ADD.L   D0,D2
+    
+    MOVE.B  #$00,VERA_BASE+VERA_CTRL
+    MOVE.B  D2,VERA_BASE+VERA_ADDR0_L
+    LSR.L   #8,D2
+    MOVE.B  D2,VERA_BASE+VERA_ADDR0_M
+    MOVE.B  #$10,VERA_BASE+VERA_ADDR0_H
+    
+    MOVE.B  D1,VERA_BASE+VERA_DATA0
+    MOVE.B  V_TEXT_ATTR,VERA_BASE+VERA_DATA0
+    
+    ADDQ.W  #1,V_CUR_COL
+    CMPI.W  #71,V_CUR_COL                   ; Wrap at Column 70 (71 causes wrap)
+    BLT.S   VERA_PUT_DONE
+    
+    MOVE.W  #10,V_CUR_COL                   ; Wrap to Column 10
+    BSR.S   VERA_ADVANCE_ROW
+VERA_PUT_DONE:
+    MOVEM.L (SP)+,D0-D2/A0
+    RTS
+
+VERA_ADVANCE_ROW:
+    ADDQ.W  #1,V_CUR_ROW
+    ANDI.W  #$3F,V_CUR_ROW
+    
+    ; Scroll check based on V_VIEW_H from NVRAM
+    MOVE.W  V_CUR_ROW,D0
+    MOVE.W  V_SCROLL_ROW,D1
+    SUB.W   D1,D0
+    ANDI.W  #$3F,D0
+    
+    MOVEQ   #0,D1
+    MOVE.B  V_VIEW_H,D1
+    CMP.W   D1,D0
+    BLT.S   .no_scroll
+    
+    ADDQ.W  #1,V_SCROLL_ROW
+    ANDI.W  #$3F,V_SCROLL_ROW
+    MOVE.W  V_SCROLL_ROW,D0
+    LSL.W   #3,D0
+    MOVE.B  D0,VERA_BASE+VERA_L0_VSCROLL_L
+    LSR.W   #8,D0
+    MOVE.B  D0,VERA_BASE+VERA_L0_VSCROLL_H
+.no_scroll:
+    RTS
+
+; =====================================================================
+; MESSAGES
+; =====================================================================
+STR_HDR:    DC.B    $0D,$0A,"VERA Init v2 (FULLY DYNAMIC NVRAM LOADER)",$0D,$0A,0
+STR_ERR_MAGIC:  DC.B "ERROR: NVRAM Magic ($A5) NOT FOUND!",0
+STR_ERR_CHKSUM: DC.B "ERROR: NVRAM Checksum Mismatch!",0
+STR_HALT:       DC.B $0D,$0A,"Initialization ABORTED.",$0D,$0A,0
+STR_DONE:       DC.B $0D,$0A,"VERA Initialized Successfully.",$0D,$0A,0
+
+STR_VERA_BANNER:
+    DC.B    "AGFA COMPUGRAPHIC 9000PS", $0D, $0A
+    DC.B    "========================", $0D, $0A, $0D, $0A
+    DC.B    "VERA Fully Configured from NVRAM.", $0D, $0A
+    DC.B    "Display Framing & Colors Pulled from EEPROM.", $0D, $0A, 0
+
+    ALIGN 4
+PAL_DATA:
+    DC.B $00,$00,$FF,$0F,$00,$08,$FE,$0A,$4C,$0C,$C5,$00,$0A,$00,$E7,$0E,$85,$0D,$40,$06,$77,$0F,$33,$03,$77,$07,$F6,$0A,$8F,$00,$BB,$0B
+    DC.B $00,$00,$11,$01,$22,$02,$33,$03,$44,$04,$55,$05,$66,$06,$77,$07,$88,$08,$99,$09,$AA,$0A,$BB,$0B,$CC,$0C,$DD,$0D,$EE,$0E,$FF,$0F
+    DC.B $11,$02,$33,$04,$44,$06,$66,$08,$88,$0A,$99,$0C,$BB,$0F,$11,$02,$22,$04,$33,$06,$44,$08,$55,$0A,$66,$0C,$77,$0F,$00,$02,$11,$04
+    DC.B $11,$06,$22,$08,$22,$0A,$33,$0C,$33,$0F,$00,$02,$00,$04,$00,$06,$00,$08,$00,$0A,$00,$0C,$00,$0F,$21,$02,$43,$04,$64,$06,$86,$08
+    DC.B $A8,$0A,$C9,$0C,$EB,$0F,$11,$02,$32,$04,$53,$06,$74,$08,$95,$0A,$B6,$0C,$D7,$0F,$10,$02,$31,$04,$51,$06,$62,$08,$82,$0A,$A3,$0C
+    DC.B $C3,$0F,$10,$02,$30,$04,$40,$06,$60,$08,$80,$0A,$90,$0C,$B0,$0F,$21,$01,$43,$03,$64,$05,$86,$07,$A8,$09,$C9,$0B,$FB,$0D,$21,$01
+    DC.B $42,$03,$63,$04,$84,$06,$A5,$08,$C6,$09,$F7,$0B,$20,$01,$41,$02,$61,$04,$82,$05,$A2,$06,$C3,$08,$F3,$09,$20,$01,$40,$02,$60,$03
+    DC.B $80,$04,$A0,$05,$C0,$06,$F0,$07,$21,$01,$43,$03,$65,$04,$86,$06,$A8,$08,$CA,$09,$FC,$0B,$21,$01,$42,$02,$64,$03,$85,$04,$A6,$05
+    DC.B $C8,$06,$F9,$07,$20,$00,$41,$01,$62,$01,$83,$02,$A4,$02,$C5,$03,$F6,$03,$20,$00,$41,$00,$61,$00,$82,$00,$A2,$00,$C3,$00,$F3,$00
+    DC.B $22,$01,$44,$03,$66,$04,$88,$06,$AA,$08,$CC,$09,$FF,$0B,$22,$01,$44,$02,$66,$03,$88,$04,$AA,$05,$CC,$06,$FF,$07,$22,$00,$44,$01
+    DC.B $66,$01,$88,$02,$AA,$02,$CC,$03,$FF,$03,$22,$00,$44,$00,$66,$00,$88,$00,$AA,$00,$CC,$00,$FF,$00,$12,$01,$34,$03,$56,$04,$68,$06
+    DC.B $8A,$08,$AC,$09,$CF,$0B,$12,$01,$24,$02,$46,$03,$58,$04,$6A,$05,$8C,$06,$9F,$07,$02,$00,$14,$01,$26,$01,$38,$02,$4A,$02,$5C,$03
+    DC.B $6F,$03,$02,$00,$14,$00,$16,$00,$28,$00,$2A,$00,$3C,$00,$3F,$00,$12,$01,$34,$03,$46,$05,$68,$07,$8A,$09,$9C,$0B,$BF,$0D,$12,$01
+    DC.B $24,$03,$36,$04,$48,$06,$5A,$08,$6C,$09,$7F,$0B,$02,$01,$14,$02,$16,$04,$28,$05,$2A,$06,$3C,$08,$3F,$09,$02,$01,$04,$02,$06,$03
+    DC.B $08,$04,$0A,$05,$0C,$06,$0F,$07,$12,$02,$34,$04,$46,$06,$68,$08,$8A,$0A,$9C,$0C,$BE,$0F,$11,$02,$23,$04,$35,$06,$47,$08,$59,$0A
+    DC.B $6B,$0C,$7D,$0F,$01,$02,$13,$04,$15,$06,$26,$08,$28,$0A,$3A,$0C,$3C,$0F,$01,$02,$03,$04,$04,$06,$06,$08,$08,$0A,$09,$0C,$0B,$0F
+
+    ALIGN 4
+FONT_DATA:
+    INCBIN  "font.bin"

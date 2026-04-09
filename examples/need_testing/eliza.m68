@@ -1,0 +1,358 @@
+; =====================================================================
+; ELIZA - THE 68020 ASSEMBLY THERAPIST (VERSION 2.2)
+; Target: Agfa Compugraphic 9000PS (68020 / Z85C30)
+; =====================================================================
+
+    ORG $02050000
+
+    EVEN
+; Monitor API Vectors
+PUTCHAR     EQU $0406
+GETCHAR     EQU $040C
+PRINTSTR    EQU $0412
+GETLINE     EQU $0418
+EXIT_PROG   EQU $041E
+
+; Constants
+MAX_LINE    EQU 80
+BUFFER_BASE EQU $02060000
+USER_BUF    EQU BUFFER_BASE
+REPLY_BUF   EQU BUFFER_BASE+200
+GEN_PTR     EQU BUFFER_BASE+300
+
+START:
+    movem.l D0-D7/A0-A6,-(SP)
+    clr.l   GEN_PTR
+
+    lea     BANNER_MSG,A0
+    jsr     PRINTSTR
+
+MAIN_LOOP:
+    lea     PROMPT_MSG,A0
+    jsr     PRINTSTR
+
+    lea     USER_BUF,A0
+    jsr     GETLINE
+    tst.b   USER_BUF
+    beq     MAIN_LOOP
+
+    lea     USER_BUF,A0
+    bsr     TO_UPPER
+
+    bsr     CHECK_EXIT
+    tst.l   D0
+    bne     GOODBYE
+
+    bsr     DO_ELIZA
+
+    lea     REPLY_BUF,A0
+    jsr     PRINTSTR
+    lea     CRLF_MSG,A0
+    jsr     PRINTSTR
+
+    bra     MAIN_LOOP
+
+GOODBYE:
+    lea     EXIT_MSG,A0
+    jsr     PRINTSTR
+    movem.l (SP)+,D0-D7/A0-A6
+    jmp     EXIT_PROG
+
+; --- Subroutines ---
+
+    EVEN
+TO_UPPER:
+    move.l  A0,A1
+.loop:
+    move.b  (A1),D0
+    beq.s   .done
+    cmp.b   #'a',D0
+    blt.s   .next
+    cmp.b   #'z',D0
+    bgt.s   .next
+    subi.b  #$20,D0
+    move.b  D0,(A1)
+.next:
+    addq.l  #1,A1
+    bra.s   .loop
+.done:
+    rts
+
+    EVEN
+CHECK_EXIT:
+    lea     USER_BUF,A0
+    lea     STR_BYE,A1
+    bsr     FIND_STR
+    tst.l   A1
+    bne.s   .found
+    lea     USER_BUF,A0
+    lea     STR_QUIT,A1
+    bsr     FIND_STR
+    tst.l   A1
+    bne.s   .found
+    moveq   #0,D0
+    rts
+.found:
+    moveq   #1,D0
+    rts
+
+    EVEN
+FIND_STR:
+    movem.l D1-D2/A0/A2-A3,-(SP)
+    move.l  A1,D1
+.outer:
+    move.b  (A0),D0
+    beq.s   .fail
+    move.l  A0,A2
+    move.l  D1,A3
+.inner:
+    move.b  (A3)+,D2
+    beq.s   .match
+    move.b  (A2)+,D0
+    beq.s   .next_outer
+    cmp.b   D2,D0
+    beq.s   .inner
+.next_outer:
+    addq.l  #1,A0
+    bra.s   .outer
+.match:
+    move.l  A0,A1
+    bra.s   .done
+.fail:
+    suba.l  A1,A1
+.done:
+    movem.l (SP)+,D1-D2/A0/A2-A3
+    rts
+
+    EVEN
+DO_ELIZA:
+    movem.l D0-D7/A0-A4,-(SP)
+    lea     KEYWORDS,A2
+.loop:
+    move.l  (A2)+,D0
+    beq.s   .default
+    
+    move.l  D0,A1
+    lea     USER_BUF,A0
+    bsr     FIND_STR
+    tst.l   A1
+    beq.s   .skip
+    
+    move.l  A1,A3
+    move.l  D0,A1
+    move.l  (A2)+,A4
+    move.l  (A2),D7
+    jsr     (A4)
+    bra.s   .exit
+.skip:
+    addq.l  #8,A2
+    bra.s   .loop
+.default:
+    bsr     GET_GENERIC_RESP
+.exit:
+    movem.l (SP)+,D0-D7/A0-A4
+    rts
+
+    EVEN
+GET_GENERIC_RESP:
+    move.l  GEN_PTR,D0
+    andi.l  #3,D0
+    lea     GENERIC_LIST,A2
+    move.l  (A2,D0.L*4),A0
+    lea     REPLY_BUF,A1
+    bsr     STRCPY
+    addq.l  #1,GEN_PTR
+    rts
+
+    EVEN
+PROC_XFORM:
+    move.l  A0,A4
+    lea     REPLY_BUF,A1
+    move.l  A4,A0
+    bsr     STRCPY
+    subq.l  #1,A1
+    move.b  #' ',(A1)+
+    
+    move.l  A3,A0
+    add.l   D7,A0
+.skip_sp:
+    cmp.b   #' ',(A0)
+    bne.s   .go
+    addq.l  #1,A0
+    bra.s   .skip_sp
+.go:
+    bsr     COPY_AND_SWAP
+    rts
+
+    EVEN
+RESP_HELLO:   lea STR_HELLO_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_FAM:     lea STR_FAM_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_COMP:    lea STR_COMP_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_WHY:     lea STR_WHY_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_FEEL:    lea STR_FEEL_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_YES:     lea STR_YES_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_NO:      lea STR_NO_RESP,A0
+              lea REPLY_BUF,A1
+              bra STRCPY
+    EVEN
+RESP_YOUARE:  lea STR_YOUARE_PRE,A0
+              bsr PROC_XFORM
+              rts
+    EVEN
+RESP_IAM:     lea STR_IAM_PRE,A0
+              bsr PROC_XFORM
+              rts
+    EVEN
+RESP_CANI:    lea STR_CANI_PRE,A0
+              bsr PROC_XFORM
+              rts
+
+    EVEN
+COPY_AND_SWAP:
+.loop:
+    move.b  (A0)+,D0
+    beq.s   .done
+    
+    cmp.b   #'M',D0
+    bne.s   .next
+    cmp.b   #'Y',(A0)
+    bne.s   .me
+    move.b  1(A0),D1
+    bsr     IS_BOUNDARY
+    tst.b   D1
+    beq.s   .next
+    move.b  #'Y',(A1)+
+    move.b  #'O',(A1)+
+    move.b  #'U',(A1)+
+    move.b  #'R',(A1)+
+    addq.l  #1,A0
+    bra.s   .loop
+.me:
+    cmp.b   #'E',(A0)
+    bne.s   .next
+    move.b  1(A0),D1
+    bsr     IS_BOUNDARY
+    tst.b   D1
+    beq.s   .next
+    move.b  #'Y',(A1)+
+    move.b  #'O',(A1)+
+    move.b  #'U',(A1)+
+    addq.l  #1,A0
+    bra.s   .loop
+.next:
+    move.b  D0,(A1)+
+    bra.s   .loop
+.done:
+    move.b  #'?',(A1)+
+    move.b  #0,(A1)
+    rts
+
+    EVEN
+IS_BOUNDARY:
+    tst.b   D1
+    beq.s   .yes
+    cmp.b   #' ',D1
+    beq.s   .yes
+    cmp.b   #'.',D1
+    beq.s   .yes
+    cmp.b   #',',D1
+    beq.s   .yes
+    cmp.b   #'!',D1
+    beq.s   .yes
+    cmp.b   #'?',D1
+    beq.s   .yes
+    moveq   #0,D1
+    rts
+.yes:
+    moveq   #1,D1
+    rts
+
+    EVEN
+STRCPY:
+.loop:
+    move.b  (A0)+,(A1)+
+    bne.s   .loop
+    rts
+
+; --- Data ---
+
+    EVEN
+BANNER_MSG:     DC.B $0D,$0A,"*** ELIZA - SYSTEM STARTUP OK ***", $0D,$0A
+                DC.B "GIVE ME YOUR SYSTEM LOGS... JUST KIDDING.", $0D,$0A
+                DC.B "HOW DO YOU DO?", $0D,$0A,0
+PROMPT_MSG:     DC.B "> ",0
+CRLF_MSG:       DC.B $0D,$0A,0
+EXIT_MSG:       DC.B "GOODBYE. THAT WILL BE 50 CALORIES.", $0D,$0A,0
+
+STR_BYE:  DC.B "BYE",0
+STR_QUIT: DC.B "QUIT",0
+STR_IAM:  DC.B "I AM",0
+STR_IM:   DC.B "I'M",0
+STR_HELLO: DC.B "HELLO",0
+STR_MOTHER: DC.B "MOTHER",0
+STR_FATHER: DC.B "FATHER",0
+STR_FAMILY: DC.B "FAMILY",0
+STR_COMPUTER: DC.B "COMPUTER",0
+STR_WHY: DC.B "WHY",0
+STR_FEEL: DC.B "FEEL",0
+STR_YOUARE: DC.B "YOU ARE",0
+STR_CANI: DC.B "CAN I",0
+STR_YES: DC.B "YES",0
+STR_NO: DC.B "NO",0
+
+    EVEN
+; Keyword Table: [Keyword], [Handler], [SkipLength]
+KEYWORDS:
+    DC.L STR_HELLO,    RESP_HELLO,  5
+    DC.L STR_MOTHER,   RESP_FAM,    6
+    DC.L STR_FATHER,   RESP_FAM,    6
+    DC.L STR_FAMILY,   RESP_FAM,    6
+    DC.L STR_COMPUTER, RESP_COMP,   8
+    DC.L STR_WHY,      RESP_WHY,    3
+    DC.L STR_FEEL,     RESP_FEEL,   4
+    DC.L STR_YOUARE,   RESP_YOUARE, 7
+    DC.L STR_CANI,     RESP_CANI,   5
+    DC.L STR_YES,      RESP_YES,    3
+    DC.L STR_NO,       RESP_NO,     2
+    DC.L STR_IAM,      RESP_IAM,    4
+    DC.L STR_IM,       RESP_IAM,    3
+    DC.L 0
+
+STR_HELLO_RESP: DC.B "HI. WHAT IS ON YOUR MIND?",0
+STR_FAM_RESP:   DC.B "TELL ME MORE ABOUT YOUR FAMILY.",0
+STR_COMP_RESP:  DC.B "DO COMPUTERS FRIGHTEN YOU?",0
+STR_WHY_RESP:   DC.B "WHY DO YOU ASK?",0
+STR_IAM_PRE:    DC.B "HOW LONG HAVE YOU BEEN",0
+STR_YOUARE_PRE: DC.B "WHAT MAKES YOU THINK I AM",0
+STR_CANI_PRE:   DC.B "PERHAPS YOU DON'T WANT TO",0
+STR_FEEL_RESP:  DC.B "TELL ME MORE ABOUT SUCH FEELINGS.",0
+STR_YES_RESP:   DC.B "YOU SEEM QUITE POSITIVE.",0
+STR_NO_RESP:    DC.B "WHY NOT?",0
+
+    EVEN
+GENERIC_LIST:
+    DC.L STR_GEN1, STR_GEN2, STR_GEN3, STR_GEN4
+STR_GEN1: DC.B "I SEE. PLEASE GO ON.",0
+STR_GEN2: DC.B "THAT IS VERY INTERESTING.",0
+STR_GEN3: DC.B "CAN YOU ELABORATE ON THAT?",0
+STR_GEN4: DC.B "I UNDERSTAND. TELL ME MORE.",0
+
+    END START

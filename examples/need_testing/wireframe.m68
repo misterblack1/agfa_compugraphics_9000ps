@@ -1,0 +1,189 @@
+; =====================================================================
+; 3D Wireframe Mesh Renderer
+; Target: Agfa Compugraphic 9000PS (68020 / Z85C30)
+;
+; Assemble with:
+;   vasmm68k_mot -m68020 -Fsrec -o wireframe.s19 wireframe.m68
+;
+; Load via monitor L command, then run with: G 02050000
+;
+; Register map (plot loops):
+;   D0 = scratch only    D1 = X_FP (word, X*256)
+;   D2 = Y_FP (word)     D3 = Y_INT counter (0..80)
+;   D4 = Z_FP (long)     D5 = SX (long)
+;   D6 = X_INT counter   D7 = SY (long)
+;   A1 = GRID_BASE (constant throughout)
+; =====================================================================
+
+    ORG $02050000
+
+PUTCHAR     EQU $0406
+PRINTSTR    EQU $0412
+EXIT_PROG   EQU $041E
+
+GRID_W      EQU 80
+GRID_H      EQU 24
+GRID_BASE   EQU $02060000
+
+START:
+    movem.l D0-D7/A0-A2,-(SP)
+
+    lea     MSG_HEADER,A0
+    jsr     PRINTSTR
+
+    ; ── Init grid to spaces ────────────────────────────────────────
+    lea     GRID_BASE,A1            ; A1 = grid base (stays fixed)
+    move.l  #(GRID_W*GRID_H-1),D0
+.init:
+    move.b  #32,(A1,D0.L)
+    dbf     D0,.init
+
+    ; ── Outer loop: X_INT = 0..80, X = X_INT*0.25 - 10 ───────────
+    moveq   #0,D6                   ; D6 = X_INT counter
+
+.xloop:
+    cmp.w   #81,D6
+    bge     .render
+
+    ; X_FP = X_INT*64 - 2560  (scale: 256 = 1.0, step 64 = 0.25)
+    move.w  D6,D1
+    lsl.w   #6,D1
+    sub.w   #2560,D1                ; D1 = X_FP
+
+    moveq   #0,D3                   ; D3 = Y_INT counter
+
+.yloop:
+    cmp.w   #81,D3
+    bge     .xnext
+
+    ; Y_FP = Y_INT*64 - 2560
+    move.w  D3,D2
+    lsl.w   #6,D2
+    sub.w   #2560,D2                ; D2 = Y_FP
+
+    ; ── Z = (X²+Y²)/12, result in D4 (scale 256) ─────────────────
+    move.w  D1,D4
+    muls    D4,D4                   ; D4 = X_FP² (32-bit)
+    asr.l   #8,D4                   ; D4 = X²*256
+
+    move.w  D2,D0
+    muls    D0,D0                   ; D0 = Y_FP² (32-bit)
+    asr.l   #8,D0                   ; D0 = Y²*256
+
+    add.l   D0,D4                   ; D4 = (X²+Y²)*256
+    divs.l  #12,D4                  ; D4 = Z*256 (Z_FP)
+
+    ; ── SX = INT(40 + (X-Y)*2) ────────────────────────────────────
+    move.w  D1,D5
+    ext.l   D5                      ; sign-extend X_FP word→long
+    move.w  D2,D0
+    ext.l   D0                      ; sign-extend Y_FP word→long
+    sub.l   D0,D5                   ; D5 = (X-Y)*256
+    asl.l   #1,D5                   ; D5 = (X-Y)*2*256
+    add.l   #(40*256),D5
+    asr.l   #8,D5                   ; D5 = SX
+
+    ; ── SY = INT(5 + Z - (X+Y)/2) ─────────────────────────────────
+    move.w  D1,D0
+    ext.l   D0                      ; X_FP sign-extended
+    move.w  D2,D7
+    ext.l   D7                      ; Y_FP sign-extended
+    add.l   D0,D7                   ; D7 = (X+Y)*256
+    asr.l   #1,D7                   ; D7 = (X+Y)/2*256
+    move.l  D4,D0                   ; D0 = Z_FP
+    sub.l   D7,D0                   ; D0 = (Z-(X+Y)/2)*256
+    add.l   #(5*256),D0
+    asr.l   #8,D0                   ; D0 = SY
+    move.l  D0,D7                   ; D7 = SY
+
+    ; ── Bounds check ──────────────────────────────────────────────
+    cmp.l   #0,D5
+    blt     .ynext
+    cmp.l   #(GRID_W-1),D5
+    bgt     .ynext
+    cmp.l   #0,D7
+    blt     .ynext
+    cmp.l   #(GRID_H-1),D7
+    bgt     .ynext
+
+    ; ── Edge test: draw where X or Y is near an even integer ──────
+    ; BASIC: ABS(X2-INT(X2+0.01))<0.05 where X2=ABS(X/2)
+    ; In fixed-point: fractional byte of ABS(X_FP/2) < 13 (=0.05*256)
+    move.w  D1,D0
+    asr.w   #1,D0                   ; D0 = X_FP/2
+    bpl.s   .xabs
+    neg.w   D0                      ; D0 = ABS(X_FP/2)
+.xabs:
+    and.w   #$FF,D0                 ; fractional byte
+    cmp.w   #13,D0
+    blt     .plot
+
+    move.w  D2,D0
+    asr.w   #1,D0                   ; D0 = Y_FP/2
+    bpl.s   .yabs
+    neg.w   D0
+.yabs:
+    and.w   #$FF,D0
+    cmp.w   #13,D0
+    blt     .plot
+
+    bra     .ynext
+
+.plot:
+    move.l  D7,D0
+    mulu.l  #GRID_W,D0
+    add.l   D5,D0
+    move.b  #'+',(A1,D0.L)
+
+.ynext:
+    addq.w  #1,D3
+    bra     .yloop
+
+.xnext:
+    addq.w  #1,D6
+    bra     .xloop
+
+    ; ── Print grid ────────────────────────────────────────────────
+.render:
+    moveq   #0,D7                   ; D7 = row
+
+.rowloop:
+    cmp.l   #GRID_H,D7
+    bge     .alldone
+
+    moveq   #0,D6                   ; D6 = col
+
+.colloop:
+    cmp.l   #GRID_W,D6
+    bge     .newline
+
+    move.l  D7,D0
+    mulu.l  #GRID_W,D0
+    add.l   D6,D0
+    move.b  (A1,D0.L),D0            ; D0.b = character
+    jsr     PUTCHAR
+
+    addq.l  #1,D6
+    bra     .colloop
+
+.newline:
+    move.b  #$0D,D0
+    jsr     PUTCHAR
+    move.b  #$0A,D0
+    jsr     PUTCHAR
+    addq.l  #1,D7
+    bra     .rowloop
+
+.alldone:
+    lea     MSG_DONE,A0
+    jsr     PRINTSTR
+    movem.l (SP)+,D0-D7/A0-A2
+    jmp     EXIT_PROG
+
+MSG_HEADER:
+    dc.b    "Computing wireframe...",13,10,0
+MSG_DONE:
+    dc.b    "Done.",13,10,0
+
+    ALIGN 4
+    END START
