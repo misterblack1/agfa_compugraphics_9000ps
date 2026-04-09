@@ -4,7 +4,7 @@ As seen on a video series on [Adrian's Digital Basement](https://www.youtube.com
 
 ## What is This?
 
-A from-scratch machine language monitor and replacement ROM firmware for the **Agfa Compugraphic 9000PS** RIP main processor board, built entirely through hardware reverse engineering. The Agfa Compugraphic 9000PS PostScript Level 1 RIP (Raster Image Processor) designed in 1986 built around a **Motorola 68020** CPU at 16 MHz with 4 MB of RAM. This project is a **complete replacement firmware** that provides:
+A from-scratch machine language monitor and replacement ROM firmware for the **Agfa Compugraphic 9000PS** RIP main processor board, built entirely through hardware reverse engineering. The Agfa Compugraphic 9000PS was a PostScript Level 1 RIP (Raster Image Processor) designed in 1986. This new ROM provides:
 
 - **Interactive machine language monitor** - memory examine/edit, fill, move, hex dump, register display, S-record load/dump, and more
 - **EhBASIC 3.54** - embedded 68K BASIC interpreter, launchable from the monitor prompt
