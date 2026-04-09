@@ -33,16 +33,16 @@ All of this was developed without any original documentation. The hardware was r
 | Component | Details |
 |-----------|---------|
 | **CPU** | Motorola 68020 @ 16 MHz |
-| **RAM** | 4 MB ($02000000-$023FFFFF), tested on cold boot |
-| **ROM** | 128 KB, Bank 0 ($000000-$01FFFF), 4× AM27C256 EPROMs |
-| **Serial** | Zilog Z85C30 SCC Channel A, DB-25 RS-232 at 9600 8N1 |
+| **RAM** | 4 MB soldered, 6 MB possible |
+| **ROM** | 640k in 5 Banks, using 27C256 EPROMs |
+| **Serial** | Zilog Z85C30 |
 | **Graphics** | VERA (from the Commander X16) graphics controller |
 | **SCSI** | AM5380 SCSI controller |
-| **Timer/IO** | 6522 VIA |
+| **Timer/IO** | 6522 VIA x2, but one removed for the VERA |
 
 ---
 
-## Monitor Commands
+## AGFA-MON Commands
 
 ```
 B                       Launch BASIC (CALL 1054 to exit)
