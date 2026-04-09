@@ -4,6 +4,8 @@ A from-scratch machine language monitor and replacement ROM firmware for the **A
 
 As seen on a video series on [Adrian's Digital Basement](https://www.youtube.com/@adriansdigitalbasement)
 
+[Original firmware and drive image](https://archive.org/details/agfa-computgraphi-9000-ps)
+
 ---
 
 ## What is This?
