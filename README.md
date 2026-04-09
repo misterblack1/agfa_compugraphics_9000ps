@@ -145,20 +145,6 @@ Example programs in [`examples/`](examples/) demonstrate the ROM API, VERA graph
 
 ---
 
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [`docs/agfa_mon.md`](docs/agfa_mon.md) | Complete firmware reference - boot sequence, commands, exception vectors |
-| [`docs/agfa_mon_api_digest.md`](docs/agfa_mon_api_digest.md) | Full API reference with register usage and call signatures |
-| [`docs/agfa_mon_memory_map.md`](docs/agfa_mon_memory_map.md) | Memory map - RAM, EEPROM, hardware registers |
-| [`docs/vera_programmers_guide_digested.md`](docs/vera_programmers_guide_digested.md) | VERA graphics controller programming guide |
-| [`docs/vera_palette_fading.md`](docs/vera_palette_fading.md) | VSYNC-synced palette fading techniques |
-| [`docs/vera_shape_drawing.md`](docs/vera_shape_drawing.md) | Shape drawing in 4bpp bitmap mode |
-| [`examples/README.md`](examples/README.md) | Example programs guide and API usage patterns |
-
----
-
 ## Credits
 
 - **EhBASIC** - 68K port of the EhBASIC 3.54 interpreter by Lee Davison
