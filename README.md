@@ -1,18 +1,10 @@
 # Agfa Compugraphic 9000PS Reverse Engineering Project
 
-A from-scratch machine language monitor and replacement ROM firmware for the **Agfa Compugraphic 9000PS** RIP main processor board, built entirely through hardware reverse engineering.
-
 As seen on a video series on [Adrian's Digital Basement](https://www.youtube.com/@adriansdigitalbasement)
-
-Original firmware and drive image on [archive.org](https://archive.org/details/agfa-computgraphi-9000-ps)
-
-Repo for the Agfa I/O Board Reverse Engineering on [Github.com](https://github.com/misterblack1/agfa_ebs_pnafati)
-
----
 
 ## What is This?
 
-The Agfa Compugraphic 9000PS PostScript Level 1 RIP (Raster Image Processor) designed in 1986 built around a **Motorola 68020** CPU at 16 MHz with 4 MB of RAM. This project is a **complete replacement firmware** that provides:
+A from-scratch machine language monitor and replacement ROM firmware for the **Agfa Compugraphic 9000PS** RIP main processor board, built entirely through hardware reverse engineering. The Agfa Compugraphic 9000PS PostScript Level 1 RIP (Raster Image Processor) designed in 1986 built around a **Motorola 68020** CPU at 16 MHz with 4 MB of RAM. This project is a **complete replacement firmware** that provides:
 
 - **Interactive machine language monitor** - memory examine/edit, fill, move, hex dump, register display, S-record load/dump, and more
 - **EhBASIC 3.54** - embedded 68K BASIC interpreter, launchable from the monitor prompt
@@ -25,6 +17,10 @@ The Agfa Compugraphic 9000PS PostScript Level 1 RIP (Raster Image Processor) des
 All of this was developed without any original documentation. The hardware was reverse engineered by analyzing the original ROMs, probing the board, and writing test code.
 
 ![Agfa Computergraphic 9000PS](https://github.com/misterblack1/agfa_ebs_pnafati/blob/main/images/Compugraphic9000ps.jpg?raw=true)
+
+Original firmware and drive image on [archive.org](https://archive.org/details/agfa-computgraphi-9000-ps)
+
+Repo for the Agfa I/O Board Reverse Engineering on [Github.com](https://github.com/misterblack1/agfa_ebs_pnafati)
 
 ---
 
