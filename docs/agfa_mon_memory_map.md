@@ -2,7 +2,6 @@
 
 **RAM range:** `$02000000`-`$023FFFFF` (4 MB)
 **EEPROM range:** `$07100000`-`$071001FF` (512 bytes)
-**Sources:** `agfa-monitor/agfa-mon.m68`, `docs/vera/vera_console_api.md`, hardware design
 
 ---
 
