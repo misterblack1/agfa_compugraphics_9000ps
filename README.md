@@ -4,9 +4,9 @@ A from-scratch machine language monitor and replacement ROM firmware for the **A
 
 As seen on a video series on [Adrian's Digital Basement](https://www.youtube.com/@adriansdigitalbasement)
 
-[Original firmware and drive image](https://archive.org/details/agfa-computgraphi-9000-ps)
+Original firmware and drive image on [archive.org](https://archive.org/details/agfa-computgraphi-9000-ps)
 
-[Agfa I/O Board Reverse Engineering](https://github.com/misterblack1/agfa_ebs_pnafati)
+Repo for the Agfa I/O Board Reverse Engineering on [Github.com](https://github.com/misterblack1/agfa_ebs_pnafati)
 
 ---
 
