@@ -6,6 +6,8 @@ As seen on a video series on [Adrian's Digital Basement](https://www.youtube.com
 
 [Original firmware and drive image](https://archive.org/details/agfa-computgraphi-9000-ps)
 
+[Agfa I/O Board Reverse Engineering](https://github.com/misterblack1/agfa_ebs_pnafati)
+
 ---
 
 ## What is This?
@@ -21,6 +23,8 @@ The Agfa Compugraphic 9000PS PostScript Level 1 RIP (Raster Image Processor) des
 - **CP/M and UNIX boot stubs** - jumps to CP/M-68K and Minix, in ROM
 
 All of this was developed without any original documentation. The hardware was reverse engineered by analyzing the original ROMs, probing the board, and writing test code.
+
+![Agfa Computergraphic 9000PS](https://github.com/misterblack1/agfa_ebs_pnafati/blob/main/images/Compugraphic9000ps.jpg?raw=true)
 
 ---
 
